@@ -1,0 +1,4 @@
+aiohttp>=3.9.0
+mcstatus>=11.1.1
+Pillow>=10.0.0
+PILSkinMC

@@ -1,0 +1,7 @@
+name: astrbot_plugin_get_mc_server_info
+display_name: 获取 MC 服务器信息
+desc: 会话隔离管理 MC 服务器，支持静默轮询、模板渲染、玩家头像缓存与模板切换。
+version: v1.5.0
+author: TW2NTY_NIN9
+repo: https://github.com/tw2ni9-arisu/_astrbot_plugin_get_mc_server_info
+astrbot_version: ">=4.16,<5"

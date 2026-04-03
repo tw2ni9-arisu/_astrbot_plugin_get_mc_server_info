@@ -1,0 +1,50 @@
+{
+  "silent_query_interval_seconds": {
+    "type": "int",
+    "description": "Interval between background silent polling rounds (seconds).",
+    "hint": "Default 1800 (30 minutes). Minimum 60.",
+    "default": 1800
+  },
+  "history_limit": {
+    "type": "int",
+    "description": "Max retained latency history points per server.",
+    "hint": "Default 48 (about 24h if poll interval is 30m). Minimum 1.",
+    "default": 48
+  },
+  "cache_ttl_seconds": {
+    "type": "int",
+    "description": "TTL for cached icon/avatar files (seconds).",
+    "hint": "Default 86400 (24 hours). Minimum 60.",
+    "default": 86400
+  },
+  "status_timeout_seconds": {
+    "type": "int",
+    "description": "Timeout for a single MC status request (seconds).",
+    "hint": "Default 10. Minimum 1.",
+    "default": 10
+  },
+  "query_all_concurrency": {
+    "type": "int",
+    "description": "Max concurrent requests for '#查询服务器' (all servers).",
+    "hint": "Default 5. Minimum 1.",
+    "default": 5
+  },
+  "avatar_download_concurrency": {
+    "type": "int",
+    "description": "Max concurrent player skin/avatar downloads.",
+    "hint": "Default 5. Minimum 1.",
+    "default": 5
+  },
+  "avatar_download_retries": {
+    "type": "int",
+    "description": "Retry count for each avatar download candidate.",
+    "hint": "Default 2 (total attempts = 1 + retries). Minimum 0.",
+    "default": 2
+  },
+  "skin_api_url_template": {
+    "type": "string",
+    "description": "Skin API URL template used to fetch skin by UUID.",
+    "hint": "Must contain '{uuid}' placeholder. Invalid value falls back to default.",
+    "default": "https://skin.mualliance.ltd/api/union/skin/byuuid/{uuid}"
+  }
+}
