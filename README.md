@@ -23,7 +23,7 @@
 
 ## 配置说明
 
-插件运行配置由 `_conf_schema.json` 定义，可在 AstrBot 插件配置中修改：
+插件运行配置由 `_conf_schema.json` 定义，可在 AstrBot 插件配置中修改：（此处默认使用mua联合皮肤站API）
 
 | Key | 默认值 | 说明 |
 | --- | --- | --- |
