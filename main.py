@@ -216,18 +216,44 @@ class Main(Star):
 
     @filter.regex(r"^#查询服务器(?:\s+\S+)?\s*$")
     async def query_server(self, event: AstrMessageEvent):
-        """查询 MC 服务器：#查询服务器 [服务器地址]"""
+        """查询 MC 服务器：#查询服务器 [服务器名称|服务器地址]"""
         # 无参数 => 查询当前会话全部服务器
-        # 有参数 => 查询当前会话内指定服务器
+        # 有参数 => 先按名称匹配当前会话已添加服务器，未命中则按地址直连查询
         matched = QUERY_SERVER_PATTERN.match(event.message_str.strip())
         if not matched:
-            yield event.plain_result("参数格式错误：#查询服务器 [服务器地址]")
+            yield event.plain_result("参数格式错误：#查询服务器 [服务器名称|服务器地址]")
             return
 
-        address_arg = matched.group(1)
-        if address_arg:
-            yield await self._query_single_server(
-                event, self._normalize_address(address_arg)
+        query_arg = matched.group(1)
+        if query_arg:
+            query_token = query_arg.strip()
+            session_key = event.unified_msg_origin
+            async with self._store_lock:
+                store = await self._load_store()
+                session_obj = self._get_or_create_session(store, session_key)
+                servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
+
+            matched_addresses = self._find_server_addresses_by_name(
+                servers,
+                query_token,
+            )
+            if len(matched_addresses) > 1:
+                return_message = (
+                    f"查询失败！检测到多个同名服务器 [{query_token}]，请使用服务器地址查询"
+                )
+                yield event.plain_result(return_message)
+                return
+            if len(matched_addresses) == 1:
+                yield await self._query_single_server(event, matched_addresses[0])
+                return
+
+            # 未命中已添加的服务器名称时，按地址直接进行一次主动查询：
+            # - 不写入会话服务器列表
+            # - 不拉取/缓存玩家头像
+            # - 仅渲染并返回本次查询结果
+            yield await self._query_direct_address(
+                event,
+                self._normalize_address(query_token),
             )
             return
 
@@ -334,6 +360,7 @@ class Main(Star):
         # 4) 清理过期缓存并生成渲染图
         await self._cleanup_expired_cache()
         icon_path = self._icon_cache_path(address)
+        render_history = self._build_render_history(history, now_ts=now)
         renderer = await self._get_template_renderer(template_name)
         image_b64 = await renderer(
             server_name=server_obj["name"],
@@ -342,9 +369,45 @@ class Main(Star):
             players_online=status.players_online,
             players_max=status.players_max,
             server_version=status.version,
-            history=history,
+            history=render_history,
             icon_path=str(icon_path) if icon_path.exists() else None,
             players=players_for_render,
+        )
+        return event.make_result().base64_image(image_b64)
+
+    async def _query_direct_address(self, event: AstrMessageEvent, address: str):
+        """对指定地址执行一次临时主动查询，不写入会话存储。"""
+        session_key = event.unified_msg_origin
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            template_name = str(
+                session_obj.get("template", DEFAULT_TEMPLATE_NAME)
+                or DEFAULT_TEMPLATE_NAME
+            )
+
+        try:
+            # 地址直连查询不拉取玩家 sample，避免触发头像下载链路。
+            status = await self._fetch_server_status(address, need_players=False)
+        except Exception:
+            return event.plain_result(f"服务器 [{address}] 查询失败！")
+
+        now = int(time.time())
+        await self._cache_server_icon(address, status.icon_base64)
+        await self._cleanup_expired_cache()
+
+        icon_path = self._icon_cache_path(address)
+        renderer = await self._get_template_renderer(template_name)
+        image_b64 = await renderer(
+            server_name=address,
+            server_address=address,
+            latency=status.latency,
+            players_online=status.players_online,
+            players_max=status.players_max,
+            server_version=status.version,
+            history=self._build_render_history([], now_ts=now),
+            icon_path=str(icon_path) if icon_path.exists() else None,
+            players=[],
         )
         return event.make_result().base64_image(image_b64)
 
@@ -835,6 +898,64 @@ class Main(Star):
         if len(history) > self.history_limit:
             server_obj["latency_history"] = history[-self.history_limit :]
 
+    def _build_render_history(
+        self,
+        history_points: list[dict[str, Any]],
+        *,
+        now_ts: int | None = None,
+    ) -> list[dict[str, int]]:
+        """构建用于渲染的固定长度历史序列，缺失点补零。"""
+        limit = max(int(self.history_limit), 1)
+        interval = max(int(self.silent_query_interval_seconds), 1)
+        end_ts = int(now_ts if now_ts is not None else time.time())
+        start_ts = end_ts - (limit - 1) * interval
+
+        series = [
+            {"timestamp": start_ts + index * interval, "latency": 0}
+            for index in range(limit)
+        ]
+        latest_by_slot: dict[int, tuple[int, int]] = {}
+
+        for point in history_points:
+            try:
+                ts = int(point.get("timestamp", 0) or 0)
+                latency = int(point.get("latency", 0) or 0)
+            except Exception:
+                continue
+
+            if ts < start_ts or ts > end_ts + interval:
+                continue
+
+            # 用“最接近槽位”策略映射时间点，避免采样抖动导致的错槽。
+            slot = int((ts - start_ts + interval // 2) // interval)
+            slot = max(0, min(slot, limit - 1))
+            previous = latest_by_slot.get(slot)
+            if previous is None or ts >= previous[0]:
+                latest_by_slot[slot] = (ts, max(latency, 0))
+
+        for slot, (ts, latency) in latest_by_slot.items():
+            series[slot]["timestamp"] = ts
+            series[slot]["latency"] = latency
+
+        return series
+
+    @staticmethod
+    def _find_server_addresses_by_name(
+        servers: dict[str, dict[str, Any]],
+        query_name: str,
+    ) -> list[str]:
+        """按显示名称匹配会话内已添加服务器，返回命中的地址列表。"""
+        target = query_name.strip()
+        if not target:
+            return []
+
+        addresses: list[str] = []
+        for address, server_obj in servers.items():
+            server_name = str(server_obj.get("name", "")).strip()
+            if server_name == target:
+                addresses.append(address)
+        return addresses
+
     @staticmethod
     def _normalize_address(address: str) -> str:
         """标准化服务器地址。
@@ -985,7 +1106,8 @@ class Main(Star):
                 avatar = self._render_avatar_by_pilskinmc_object_api(skin_bytes)
                 if avatar is None:
                     avatar = self._render_avatar_head_fallback(skin)
-                avatar = avatar.resize((SKIN_SIZE, SKIN_SIZE), Image.Resampling.LANCZOS)
+                # 头像使用最近邻放大，保留像素边缘清晰度。
+                avatar = avatar.resize((SKIN_SIZE, SKIN_SIZE), Image.Resampling.NEAREST)
                 avatar_path.parent.mkdir(parents=True, exist_ok=True)
                 avatar.save(avatar_path, format="PNG")
             return True
