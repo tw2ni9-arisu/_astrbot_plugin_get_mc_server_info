@@ -1,7 +1,7 @@
 # astrbot_plugin_get_mc_server_info
 
 用于按会话（群聊/私聊）管理并查询 Minecraft Java 服务器状态的 AstrBot 插件。
-
+!!该项目含一定量AI参与内容
 ## 功能概览
 
 - 会话隔离存储：不同群聊/私聊的服务器列表互不影响。
