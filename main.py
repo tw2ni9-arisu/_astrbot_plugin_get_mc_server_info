@@ -21,6 +21,7 @@ import importlib.util
 import inspect
 import io
 import re
+import shutil
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -43,9 +44,16 @@ try:
 except Exception:
     _PILSKINMC = None
 
-ADD_SERVER_PATTERN = re.compile(r"^#添加服务器\s+(\S+)\s+(\S+)\s*$")
-QUERY_SERVER_PATTERN = re.compile(r"^#查询服务器(?:\s+(\S+))?\s*$")
+ADD_SERVER_PATTERN = re.compile(r"^#(?:添加服务器|添加)\s+(\S+)\s+(\S+)\s*$")
+QUERY_SERVER_PATTERN = re.compile(r"^#(?:查询服务器|查询)(?:\s+(\S+))?\s*$")
+DELETE_SERVER_PATTERN = re.compile(r"^#(?:删除服务器|删除)\s+(\S+)\s*$")
+LIST_SERVER_PATTERN = re.compile(r"^#(?:服务器列表|列表)\s*$")
 TEMPLATE_PATTERN = re.compile(r"^#模板(?:\s+(\S+))?\s*$")
+HELP_PATTERN = re.compile(r"^#(?:帮助|help)\s*$")
+COMMAND_FALLBACK_PATTERN = re.compile(
+    r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+)
+MOTD_FORMAT_CODE_PATTERN = re.compile(r"§.")
 
 # 默认补全端口（Minecraft Java Edition 常见端口）
 DEFAULT_PORT = 25565
@@ -71,6 +79,10 @@ AVATAR_DOWNLOAD_CONCURRENCY = 5
 AVATAR_DOWNLOAD_RETRIES = 2
 # 皮肤接口（按 UUID 获取玩家皮肤）
 SKIN_API_URL_TEMPLATE = "https://skin.mualliance.ltd/api/union/skin/byuuid/{uuid}"
+# 单服查询结果渲染缓存时长（秒）
+QUERY_RESULT_CACHE_TTL_SECONDS = 10
+# 查询渲染缓存清理任务间隔（秒）
+QUERY_CACHE_CLEANUP_INTERVAL_SECONDS = 5 * 60
 
 
 @dataclass
@@ -88,6 +100,7 @@ class ServerStatus:
     players_max: int
     icon_base64: str | None
     players: list[dict[str, str]]
+    motd: str
 
 
 @dataclass
@@ -96,6 +109,14 @@ class TemplateRendererEntry:
 
     mtime: float
     renderer: Callable[..., Awaitable[str]]
+
+
+@dataclass
+class QueryRenderCacheEntry:
+    """单服查询渲染结果缓存项。"""
+
+    expires_at: float
+    image_b64: str
 
 
 class Main(Star):
@@ -118,6 +139,8 @@ class Main(Star):
         self._avatar_download_semaphore: asyncio.Semaphore | None = None
         # 静默查询后台任务
         self._silent_task: asyncio.Task | None = None
+        # 查询渲染缓存清理后台任务
+        self._query_cache_cleanup_task: asyncio.Task | None = None
         # 缓存根目录（位于 AstrBot temp 目录下）
         self._cache_root = (
             Path(get_astrbot_temp_path()) / "astrbot_plugin_get_mc_server_info"
@@ -136,6 +159,8 @@ class Main(Star):
         self.avatar_download_retries = AVATAR_DOWNLOAD_RETRIES
         self.skin_api_url_template = SKIN_API_URL_TEMPLATE
         self.auto_append_default_port = AUTO_APPEND_DEFAULT_PORT
+        self.query_result_cache_ttl_seconds = QUERY_RESULT_CACHE_TTL_SECONDS
+        self._query_render_cache: dict[str, QueryRenderCacheEntry] = {}
 
     async def initialize(self) -> None:
         """插件初始化：创建目录、建立会话、启动后台任务。"""
@@ -151,6 +176,13 @@ class Main(Star):
         # 防止重复 initialize 导致创建多个后台轮询任务
         if self._silent_task is None or self._silent_task.done():
             self._silent_task = asyncio.create_task(self._silent_query_loop())
+        if (
+            self._query_cache_cleanup_task is None
+            or self._query_cache_cleanup_task.done()
+        ):
+            self._query_cache_cleanup_task = asyncio.create_task(
+                self._query_render_cache_cleanup_loop()
+            )
         logger.info("astrbot_plugin_get_mc_server_info initialized.")
 
     async def terminate(self) -> None:
@@ -160,25 +192,42 @@ class Main(Star):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._silent_task
             self._silent_task = None
+        if self._query_cache_cleanup_task:
+            self._query_cache_cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._query_cache_cleanup_task
+            self._query_cache_cleanup_task = None
         if self._session:
             await self._session.close()
             self._session = None
         self._avatar_download_semaphore = None
+        self._query_render_cache.clear()
         logger.info("astrbot_plugin_get_mc_server_info terminated.")
 
-    @filter.regex(r"^#添加服务器\s+\S+\s+\S+\s*$")
+    @filter.regex(r"^#(?:添加服务器|添加)\s+\S+\s+\S+\s*$")
     async def add_server(self, event: AstrMessageEvent):
-        """添加 MC 服务器：#添加服务器 <服务器名称> <服务器地址>"""
+        """添加 MC 服务器：#添加服务器 <服务器名称> <服务器地址> / #添加 <服务器名称> <服务器地址>"""
+        if self._should_ignore_self_event(event):
+            return
+
         # 1) 解析与格式校验
         matched = ADD_SERVER_PATTERN.match(event.message_str.strip())
         if not matched:
-            yield event.plain_result(
-                "参数格式错误：#添加服务器 <服务器名称> <服务器地址>"
-            )
+            yield event.plain_result(self._build_help_message())
             return
 
         name = matched.group(1).strip()
-        address = self._normalize_address(matched.group(2).strip())
+        raw_address = matched.group(2).strip()
+        if not self.auto_append_default_port and self._has_invalid_port_segment(
+            raw_address
+        ):
+            yield event.plain_result(
+                "添加失败！服务器地址端口无效，请使用 host 或 host:数字端口，"
+                "或在配置中开启 auto_append_default_port。"
+            )
+            return
+
+        address = self._normalize_address(raw_address)
         # 以 unified_msg_origin 作为“会话隔离键”
         session_key = event.unified_msg_origin
 
@@ -210,21 +259,30 @@ class Main(Star):
             }
 
             self._append_latency(servers[address], status.latency, now)
-            await self._save_store(store)
+            try:
+                await self._save_store(store)
+            except Exception:
+                yield event.plain_result("添加失败！服务器保存失败，请稍后重试")
+                return
+
+        self._clear_query_render_cache(session_key, address)
 
         # 4) 尝试缓存图标（失败不影响主流程）+ 触发一次过期清理
         await self._cache_server_icon(address, status.icon_base64)
         await self._cleanup_expired_cache()
         yield event.plain_result(f"添加成功！服务器 [{name}] 已添加")
 
-    @filter.regex(r"^#查询服务器(?:\s+\S+)?\s*$")
+    @filter.regex(r"^#(?:查询服务器|查询)(?:\s+\S+)?\s*$")
     async def query_server(self, event: AstrMessageEvent):
-        """查询 MC 服务器：#查询服务器 [服务器名称|服务器地址]"""
+        """查询 MC 服务器：#查询服务器 [服务器名称|服务器地址] / #查询 [服务器名称|服务器地址]"""
+        if self._should_ignore_self_event(event):
+            return
+
         # 无参数 => 查询当前会话全部服务器
         # 有参数 => 先按名称匹配当前会话已添加服务器，未命中则按地址直连查询
         matched = QUERY_SERVER_PATTERN.match(event.message_str.strip())
         if not matched:
-            yield event.plain_result("参数格式错误：#查询服务器 [服务器名称|服务器地址]")
+            yield event.plain_result(self._build_help_message())
             return
 
         query_arg = matched.group(1)
@@ -234,16 +292,16 @@ class Main(Star):
             async with self._store_lock:
                 store = await self._load_store()
                 session_obj = self._get_or_create_session(store, session_key)
-                servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
+                servers: dict[str, dict[str, Any]] = dict(
+                    session_obj.get("servers", {})
+                )
 
             matched_addresses = self._find_server_addresses_by_name(
                 servers,
                 query_token,
             )
             if len(matched_addresses) > 1:
-                return_message = (
-                    f"查询失败！检测到多个同名服务器 [{query_token}]，请使用服务器地址查询"
-                )
+                return_message = f"查询失败！检测到多个同名服务器 [{query_token}]，请使用服务器地址查询"
                 yield event.plain_result(return_message)
                 return
             if len(matched_addresses) == 1:
@@ -272,9 +330,12 @@ class Main(Star):
         - `#模板`：列出 templates 目录下的全部模板名（不带 .py）。
         - `#模板 <模板名>`：切换当前会话模板。
         """
+        if self._should_ignore_self_event(event):
+            return
+
         matched = TEMPLATE_PATTERN.match(event.message_str.strip())
         if not matched:
-            yield event.plain_result("切换失败！未找到模板！")
+            yield event.plain_result(self._build_help_message())
             return
 
         template_name = matched.group(1)
@@ -312,6 +373,115 @@ class Main(Star):
 
         yield event.plain_result(f"已切换至 {template_name}")
 
+    @filter.regex(r"^#(?:删除服务器|删除)\s+\S+\s*$")
+    async def delete_server(self, event: AstrMessageEvent):
+        """删除当前会话中的服务器：#删除服务器 <服务器名称> / #删除 <服务器名称>"""
+        if self._should_ignore_self_event(event):
+            return
+
+        matched = DELETE_SERVER_PATTERN.match(event.message_str.strip())
+        if not matched:
+            yield event.plain_result(self._build_help_message())
+            return
+
+        target_name = matched.group(1).strip()
+        session_key = event.unified_msg_origin
+
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
+            addresses = self._find_server_addresses_by_name(servers, target_name)
+            if not addresses:
+                yield event.plain_result(
+                    f"删除失败！当前会话内不存在名为 [{target_name}] 的服务器"
+                )
+                return
+
+            removed_count = 0
+            for address in addresses:
+                if address in servers:
+                    servers.pop(address)
+                    removed_count += 1
+            try:
+                await self._save_store(store)
+            except Exception:
+                yield event.plain_result("删除失败！服务器保存失败，请稍后重试")
+                return
+
+        for address in addresses:
+            self._clear_query_render_cache(session_key, address)
+            self._delete_server_cache(address)
+
+        yield event.plain_result(
+            f"删除成功！已删除服务器 [{target_name}] 共 {removed_count} 个，并清理对应缓存"
+        )
+
+    @filter.regex(r"^#(?:服务器列表|列表)\s*$")
+    async def list_servers(self, event: AstrMessageEvent):
+        """列出当前会话内服务器：#服务器列表 / #列表"""
+        if self._should_ignore_self_event(event):
+            return
+
+        matched = LIST_SERVER_PATTERN.match(event.message_str.strip())
+        if not matched:
+            yield event.plain_result(self._build_help_message())
+            return
+
+        session_key = event.unified_msg_origin
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
+
+        if not servers:
+            yield event.plain_result("当前会话暂无已添加服务器")
+            return
+
+        lines: list[str] = []
+        for index, server_obj in enumerate(servers.values(), start=1):
+            name = str(server_obj.get("name", "Unknown"))
+            address = str(server_obj.get("address", "Unknown"))
+            try:
+                last_latency = int(server_obj.get("last_latency", 0) or 0)
+            except Exception:
+                last_latency = 0
+            lines.append(
+                f"{index}. {name} : {address} | 最近延迟 : {max(last_latency, 0)}ms"
+            )
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.regex(
+        r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+    )
+    async def command_help_and_format_guard(self, event: AstrMessageEvent):
+        """命令帮助与格式兜底。"""
+        if self._should_ignore_self_event(event):
+            return
+
+        message = event.message_str.strip()
+        if not COMMAND_FALLBACK_PATTERN.match(message):
+            return
+
+        # 显式帮助命令
+        if HELP_PATTERN.match(message):
+            yield event.plain_result(self._build_help_message())
+            return
+
+        # 合法命令留给专用 handler 处理；仅兜底错误格式。
+        valid_patterns = (
+            ADD_SERVER_PATTERN,
+            QUERY_SERVER_PATTERN,
+            DELETE_SERVER_PATTERN,
+            LIST_SERVER_PATTERN,
+            TEMPLATE_PATTERN,
+        )
+        if any(pattern.match(message) for pattern in valid_patterns):
+            return
+
+        yield event.plain_result(self._build_help_message())
+
     async def _query_single_server(self, event: AstrMessageEvent, address: str):
         """主动查询单个服务器并返回渲染图。
 
@@ -332,6 +502,20 @@ class Main(Star):
 
         if not server_obj:
             return event.plain_result("查询失败！群聊内无该服务器")
+
+        cache_key = self._build_query_cache_key(
+            session_key=session_key,
+            address=address,
+            template_name=template_name,
+            mode="managed",
+        )
+        cached_image = self._try_get_query_render_cache(cache_key)
+        if cached_image is not None:
+            return (
+                event.make_result()
+                .message(f"缓存结果（{self.query_result_cache_ttl_seconds}秒内）")
+                .base64_image(cached_image)
+            )
 
         # 1) 拉取服务端状态（含玩家 sample）
         try:
@@ -365,17 +549,21 @@ class Main(Star):
         icon_path = self._icon_cache_path(address)
         render_history = self._build_render_history(history, now_ts=now)
         renderer = await self._get_template_renderer(template_name)
-        image_b64 = await renderer(
+        image_b64 = await self._call_template_renderer(
+            renderer,
             server_name=server_obj["name"],
             server_address=address,
             latency=status.latency,
             players_online=status.players_online,
             players_max=status.players_max,
             server_version=status.version,
+            motd=status.motd,
             history=render_history,
+            history_title=self._build_history_title(),
             icon_path=str(icon_path) if icon_path.exists() else None,
             players=players_for_render,
         )
+        self._set_query_render_cache(cache_key, image_b64)
         return event.make_result().base64_image(image_b64)
 
     async def _query_direct_address(self, event: AstrMessageEvent, address: str):
@@ -387,6 +575,20 @@ class Main(Star):
             template_name = str(
                 session_obj.get("template", DEFAULT_TEMPLATE_NAME)
                 or DEFAULT_TEMPLATE_NAME
+            )
+
+        cache_key = self._build_query_cache_key(
+            session_key=session_key,
+            address=address,
+            template_name=template_name,
+            mode="direct",
+        )
+        cached_image = self._try_get_query_render_cache(cache_key)
+        if cached_image is not None:
+            return (
+                event.make_result()
+                .message(f"缓存结果（{self.query_result_cache_ttl_seconds}秒内）")
+                .base64_image(cached_image)
             )
 
         try:
@@ -401,17 +603,21 @@ class Main(Star):
 
         icon_path = self._icon_cache_path(address)
         renderer = await self._get_template_renderer(template_name)
-        image_b64 = await renderer(
+        image_b64 = await self._call_template_renderer(
+            renderer,
             server_name=address,
             server_address=address,
             latency=status.latency,
             players_online=status.players_online,
             players_max=status.players_max,
             server_version=status.version,
+            motd=status.motd,
             history=self._build_render_history([], now_ts=now),
+            history_title=self._build_history_title(),
             icon_path=str(icon_path) if icon_path.exists() else None,
             players=[],
         )
+        self._set_query_render_cache(cache_key, image_b64)
         return event.make_result().base64_image(image_b64)
 
     async def _query_all_servers(
@@ -590,6 +796,7 @@ class Main(Star):
         version = (
             getattr(status.version, "name", "Unknown") if status.version else "Unknown"
         )
+        motd = self._extract_motd_text(getattr(status, "description", None))
         return ServerStatus(
             address=address,
             latency=max(latency, 0),
@@ -598,6 +805,7 @@ class Main(Star):
             players_max=int(getattr(status.players, "max", 0) or 0),
             icon_base64=icon_base64,
             players=players,
+            motd=motd,
         )
 
     async def _cache_server_icon(self, address: str, icon_base64: str | None) -> None:
@@ -854,6 +1062,11 @@ class Main(Star):
             AVATAR_DOWNLOAD_RETRIES,
             min_value=0,
         )
+        self.query_result_cache_ttl_seconds = self._get_config_int(
+            "query_result_cache_ttl_seconds",
+            QUERY_RESULT_CACHE_TTL_SECONDS,
+            min_value=1,
+        )
         self.skin_api_url_template = self._normalize_skin_api_url_template(
             self._get_config_str("skin_api_url_template", SKIN_API_URL_TEMPLATE)
         )
@@ -1021,6 +1234,200 @@ class Main(Star):
     def _skin_cache_path(self, address: str, uid: str) -> Path:
         """玩家头像缓存路径。"""
         return self._server_cache_dir(address) / "skins" / f"{uid}.png"
+
+    def _delete_server_cache(self, address: str) -> None:
+        """删除指定服务器的全部缓存目录。"""
+        cache_dir = self._server_cache_dir(address)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    @staticmethod
+    def _should_ignore_self_event(event: AstrMessageEvent) -> bool:
+        """若消息来自机器人自身则忽略。"""
+        sender_id = ""
+        self_id = ""
+        try:
+            sender_getter = getattr(event, "get_sender_id", None)
+            if callable(sender_getter):
+                sender_id = str(sender_getter() or "").strip()
+            else:
+                sender = getattr(getattr(event, "message_obj", None), "sender", None)
+                sender_id = str(getattr(sender, "user_id", "") or "").strip()
+        except Exception:
+            sender_id = ""
+
+        try:
+            self_getter = getattr(event, "get_self_id", None)
+            if callable(self_getter):
+                self_id = str(self_getter() or "").strip()
+            else:
+                self_id = str(
+                    getattr(getattr(event, "message_obj", None), "self_id", "") or ""
+                ).strip()
+        except Exception:
+            self_id = ""
+
+        return bool(sender_id and self_id and sender_id == self_id)
+
+    @staticmethod
+    def _build_help_message() -> str:
+        """构建命令帮助文案。"""
+        return (
+            "命令用法：\n"
+            "#添加服务器 <服务器名称> <服务器地址>\n"
+            "#添加 <服务器名称> <服务器地址>\n"
+            "#查询服务器 [服务器名称|服务器地址]\n"
+            "#查询 [服务器名称|服务器地址]\n"
+            "#删除服务器 <服务器名称>\n"
+            "#删除 <服务器名称>\n"
+            "#服务器列表\n"
+            "#列表\n"
+            "#模板 [模板名|reload]\n"
+            "#帮助 / #help"
+        )
+
+    @staticmethod
+    def _has_invalid_port_segment(address: str) -> bool:
+        """校验简单 host:port 形式下的端口是否合法。"""
+        raw = (address or "").strip()
+        if raw.count(":") != 1:
+            return False
+        host, port_str = raw.rsplit(":", 1)
+        if not host:
+            return True
+        return not port_str.isdigit()
+
+    def _build_history_title(self) -> str:
+        """构建历史图标题文本（随配置动态变化）。"""
+        points = max(int(self.history_limit), 1)
+        interval = max(int(self.silent_query_interval_seconds), 1)
+        total_seconds = points * interval
+        if total_seconds % 3600 == 0:
+            total_window = f"{total_seconds // 3600}h"
+        else:
+            total_window = f"{total_seconds // 60}m"
+        return f"历史延迟（{total_window} / {points}点）"
+
+    async def _call_template_renderer(
+        self,
+        renderer: Callable[..., Awaitable[str]],
+        **kwargs: Any,
+    ) -> str:
+        """按模板函数签名过滤参数，兼容旧模板。"""
+        try:
+            sig = inspect.signature(renderer)
+        except Exception:
+            return await renderer(**kwargs)
+
+        accepts_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        if accepts_kwargs:
+            return await renderer(**kwargs)
+
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return await renderer(**filtered)
+
+    @staticmethod
+    def _build_query_cache_key(
+        *,
+        session_key: str,
+        address: str,
+        template_name: str,
+        mode: str,
+    ) -> str:
+        return f"{session_key}|{address}|{template_name}|{mode}"
+
+    def _try_get_query_render_cache(self, cache_key: str) -> str | None:
+        now = time.time()
+        entry = self._query_render_cache.get(cache_key)
+        if not entry:
+            return None
+        if entry.expires_at <= now:
+            self._query_render_cache.pop(cache_key, None)
+            return None
+        return entry.image_b64
+
+    def _set_query_render_cache(self, cache_key: str, image_b64: str) -> None:
+        self._query_render_cache[cache_key] = QueryRenderCacheEntry(
+            expires_at=time.time() + float(self.query_result_cache_ttl_seconds),
+            image_b64=image_b64,
+        )
+
+    def _clear_query_render_cache(self, session_key: str, address: str) -> None:
+        prefix = f"{session_key}|{address}|"
+        for key in list(self._query_render_cache.keys()):
+            if key.startswith(prefix):
+                self._query_render_cache.pop(key, None)
+
+    def _cleanup_query_render_cache(self) -> int:
+        """删除已过期的查询渲染缓存项。"""
+        now = time.time()
+        removed = 0
+        for key, entry in list(self._query_render_cache.items()):
+            if entry.expires_at <= now:
+                self._query_render_cache.pop(key, None)
+                removed += 1
+        return removed
+
+    async def _query_render_cache_cleanup_loop(self) -> None:
+        """定期清理查询渲染缓存中的过期条目。"""
+        while True:
+            try:
+                removed = self._cleanup_query_render_cache()
+                if removed:
+                    logger.debug(
+                        "cleaned %s expired query render cache entries",
+                        removed,
+                    )
+            except Exception as exc:
+                logger.debug("query render cache cleanup failed: %s", exc)
+            await asyncio.sleep(QUERY_CACHE_CLEANUP_INTERVAL_SECONDS)
+
+    def _extract_motd_text(self, description: Any) -> str:
+        """提取并归一化服务端 Motd。"""
+        if description is None:
+            return ""
+        try:
+            to_plain = getattr(description, "to_plain", None)
+            if callable(to_plain):
+                text = self._strip_minecraft_format_codes(str(to_plain() or "")).strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+
+        text = self._strip_minecraft_format_codes(
+            self._flatten_motd_node(description)
+        ).strip()
+        return text[:300]
+
+    @staticmethod
+    def _strip_minecraft_format_codes(text: str) -> str:
+        """移除 Minecraft Motd 文本中的格式控制码（§x）。"""
+        if not text:
+            return ""
+        cleaned = MOTD_FORMAT_CODE_PATTERN.sub("", text)
+        # 处理末尾孤立的 §
+        return cleaned.replace("§", "")
+
+    def _flatten_motd_node(self, node: Any) -> str:
+        if node is None:
+            return ""
+        if isinstance(node, str):
+            return node
+        if isinstance(node, dict):
+            parts: list[str] = []
+            if "text" in node:
+                parts.append(self._flatten_motd_node(node.get("text")))
+            if "extra" in node:
+                parts.append(self._flatten_motd_node(node.get("extra")))
+            if "translate" in node and not parts:
+                parts.append(self._flatten_motd_node(node.get("translate")))
+            return "".join(parts)
+        if isinstance(node, (list, tuple)):
+            return "".join(self._flatten_motd_node(item) for item in node)
+        return str(node)
 
     async def _download_and_render_avatar_by_uuid(
         self,

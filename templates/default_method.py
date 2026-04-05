@@ -13,12 +13,13 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 WIDTH = 900
 PADDING = 24
 HEADER_H = 120
+MOTD_H = 72
 CHART_H = 220
 PLAYER_ROW_H = 38
 PLAYER_AVATAR_SIZE = 28
 
 # 主题色
-BG = (18, 22, 28)               
+BG = (18, 22, 28)
 CARD_ALPHA = (214, 214, 214, 40)  # 保留 15.7% 不透明度
 TEXT = (240, 245, 255)
 SUB_TEXT = (170, 182, 200)
@@ -58,8 +59,10 @@ def _list_custom_fonts() -> list[Path]:
 
 
 def _latency_color(latency: int) -> tuple[int, int, int]:
-    if latency < 100: return OK_COLOR
-    if latency < 200: return WARN_COLOR
+    if latency < 100:
+        return OK_COLOR
+    if latency < 200:
+        return WARN_COLOR
     return BAD_COLOR
 
 
@@ -85,7 +88,8 @@ def _load_template_background(width: int, height: int) -> Image.Image | None:
     parent = template_file.parent
     for ext in ("png", "jpg", "jpeg", "webp", "bmp"):
         candidate = parent / f"{stem}.{ext}"
-        if not candidate.exists(): continue
+        if not candidate.exists():
+            continue
         try:
             img = Image.open(candidate).convert("RGBA")
             return ImageOps.fit(img, (width, height), method=Image.Resampling.LANCZOS)
@@ -98,12 +102,13 @@ def _draw_history_chart(
     draw: ImageDraw.ImageDraw,
     chart_rect: tuple[int, int, int, int],
     history: list[dict[str, Any]],
+    history_title: str,
 ) -> None:
     left, top, right, bottom = chart_rect
     # 修复：不再此处绘制圆角矩形，已统一在主函数的 overlay 图层处理
     title_font = _load_font(24)
     text_font = _load_font(16)
-    draw.text((left + 16, top + 10), "历史延迟（24h / 48点）", fill=TEXT, font=title_font)
+    draw.text((left + 16, top + 10), history_title, fill=TEXT, font=title_font)
 
     plot_left, plot_right = left + 16, right - 16
     plot_top, plot_bottom = top + 52, bottom - 20
@@ -113,12 +118,18 @@ def _draw_history_chart(
         draw.line((plot_left, y, plot_right, y), fill=GRID, width=1)
 
     if not history:
-        draw.text((plot_left + 10, plot_top + 20), "暂无延迟数据", fill=SUB_TEXT, font=text_font)
+        draw.text(
+            (plot_left + 10, plot_top + 20),
+            "暂无延迟数据",
+            fill=SUB_TEXT,
+            font=text_font,
+        )
         return
 
     latencies = [max(0, int(point.get("latency", 0))) for point in history]
     lmin, lmax = min(latencies), max(latencies)
-    if lmax == lmin: lmax = lmin + 1
+    if lmax == lmin:
+        lmax = lmin + 1
 
     points = []
     n = len(latencies)
@@ -131,10 +142,28 @@ def _draw_history_chart(
     for i in range(1, len(points)):
         draw.line((points[i - 1], points[i]), fill=LINE, width=3)
     if points:
-        draw.ellipse((points[-1][0]-4, points[-1][1]-4, points[-1][0]+4, points[-1][1]+4), fill=LINE)
+        draw.ellipse(
+            (
+                points[-1][0] - 4,
+                points[-1][1] - 4,
+                points[-1][0] + 4,
+                points[-1][1] + 4,
+            ),
+            fill=LINE,
+        )
 
-    draw.text((plot_left, plot_top - 18), f"max: {max(latencies)}ms", fill=SUB_TEXT, font=text_font)
-    draw.text((plot_left + 160, plot_top - 18), f"min: {min(latencies)}ms", fill=SUB_TEXT, font=text_font)
+    draw.text(
+        (plot_left, plot_top - 18),
+        f"max: {max(latencies)}ms",
+        fill=SUB_TEXT,
+        font=text_font,
+    )
+    draw.text(
+        (plot_left + 160, plot_top - 18),
+        f"min: {min(latencies)}ms",
+        fill=SUB_TEXT,
+        font=text_font,
+    )
 
 
 def _paste_avatar(img: Image.Image, avatar_path: str, xy: tuple[int, int]) -> None:
@@ -143,13 +172,24 @@ def _paste_avatar(img: Image.Image, avatar_path: str, xy: tuple[int, int]) -> No
         file = Path(avatar_path)
         if file.exists():
             try:
-                avatar = Image.open(file).convert("RGBA").resize((PLAYER_AVATAR_SIZE, PLAYER_AVATAR_SIZE), Image.Resampling.NEAREST)
+                avatar = (
+                    Image.open(file)
+                    .convert("RGBA")
+                    .resize(
+                        (PLAYER_AVATAR_SIZE, PLAYER_AVATAR_SIZE),
+                        Image.Resampling.NEAREST,
+                    )
+                )
                 img.paste(avatar, (x, y), avatar)
                 return
-            except OSError: pass
-    fallback = Image.new("RGBA", (PLAYER_AVATAR_SIZE, PLAYER_AVATAR_SIZE), (84, 94, 110, 255))
+            except OSError:
+                pass
+    fallback = Image.new(
+        "RGBA", (PLAYER_AVATAR_SIZE, PLAYER_AVATAR_SIZE), (84, 94, 110, 255)
+    )
     d = ImageDraw.Draw(fallback)
-    d.ellipse((8, 6, 20, 18), fill=(190, 200, 220, 255)); d.rectangle((7, 18, 21, 27), fill=(190, 200, 220, 255))
+    d.ellipse((8, 6, 20, 18), fill=(190, 200, 220, 255))
+    d.rectangle((7, 18, 21, 27), fill=(190, 200, 220, 255))
     img.paste(fallback, (x, y), fallback)
 
 
@@ -164,11 +204,13 @@ async def render_server_report_image(
     history: list[dict[str, Any]],
     icon_path: str | None,
     players: list[dict[str, str]],
+    motd: str = "",
+    history_title: str = "历史延迟",
 ) -> str:
     # 1. 动态计算高度
     player_section_h = max(160, 56 + len(players) * PLAYER_ROW_H + 20)
     # 修复：PADDING * 4，确保底部有足够的留白空间
-    total_h = PADDING * 4 + HEADER_H + CHART_H + player_section_h
+    total_h = PADDING * 5 + HEADER_H + MOTD_H + CHART_H + player_section_h
 
     # 2. 准备底图
     bg_img = _load_template_background(WIDTH, total_h)
@@ -176,7 +218,7 @@ async def render_server_report_image(
         bg_img = Image.new("RGBA", (WIDTH, total_h), BG)
     else:
         bg_img = bg_img.convert("RGBA")
-    
+
     # 3. [修复核心]：使用 overlay 图层处理 Alpha 混合
     overlay = Image.new("RGBA", (WIDTH, total_h), (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
@@ -185,7 +227,11 @@ async def render_server_report_image(
     header_rect = (PADDING, PADDING, WIDTH - PADDING, PADDING + HEADER_H)
     overlay_draw.rounded_rectangle(header_rect, radius=14, fill=CARD_ALPHA)
 
-    chart_top = PADDING * 2 + HEADER_H
+    motd_top = PADDING * 2 + HEADER_H
+    motd_rect = (PADDING, motd_top, WIDTH - PADDING, motd_top + MOTD_H)
+    overlay_draw.rounded_rectangle(motd_rect, radius=12, fill=CARD_ALPHA)
+
+    chart_top = motd_top + MOTD_H + PADDING
     chart_rect = (PADDING, chart_top, WIDTH - PADDING, chart_top + CHART_H)
     overlay_draw.rounded_rectangle(chart_rect, radius=12, fill=CARD_ALPHA)
 
@@ -208,23 +254,54 @@ async def render_server_report_image(
     draw.text((text_x, PADDING + 18), server_name, fill=TEXT, font=title_font)
     draw.text((text_x, PADDING + 60), server_address, fill=SUB_TEXT, font=key_font)
     draw.text((WIDTH - 300, PADDING + 22), "当前延迟", fill=SUB_TEXT, font=key_font)
-    draw.text((WIDTH - 300, PADDING + 54), f"{latency}ms", fill=_latency_color(latency), font=value_font)
+    draw.text(
+        (WIDTH - 300, PADDING + 54),
+        f"{latency}ms",
+        fill=_latency_color(latency),
+        font=value_font,
+    )
     draw.text((WIDTH - 170, PADDING + 22), "在线人数", fill=SUB_TEXT, font=key_font)
-    draw.text((WIDTH - 170, PADDING + 54), f"{players_online}/{players_max}", fill=TEXT, font=value_font)
-    draw.text((text_x, PADDING + 90), f"版本: {server_version}", fill=SUB_TEXT, font=key_font)
+    draw.text(
+        (WIDTH - 170, PADDING + 54),
+        f"{players_online}/{players_max}",
+        fill=TEXT,
+        font=value_font,
+    )
+    draw.text(
+        (text_x, PADDING + 90), f"版本: {server_version}", fill=SUB_TEXT, font=key_font
+    )
+
+    # Motd 信息
+    motd_title_font = _load_font(20)
+    motd_font = _load_font(16)
+    draw.text((PADDING + 16, motd_top + 12), "Motd", fill=TEXT, font=motd_title_font)
+    motd_text = (motd or "").replace("\r", " ").replace("\n", " ").strip()
+    if not motd_text:
+        motd_text = "无"
+    max_chars = 88
+    if len(motd_text) > max_chars:
+        motd_text = motd_text[: max_chars - 3] + "..."
+    draw.text((PADDING + 16, motd_top + 40), motd_text, fill=SUB_TEXT, font=motd_font)
 
     # 图表内容
-    _draw_history_chart(draw, chart_rect, history)
+    _draw_history_chart(draw, chart_rect, history, history_title)
 
     # 玩家列表内容
-    draw.text((PADDING + 16, players_top + 12), "在线玩家", fill=TEXT, font=_load_font(24))
+    draw.text(
+        (PADDING + 16, players_top + 12), "在线玩家", fill=TEXT, font=_load_font(24)
+    )
     y = players_top + 52
     if not players:
         draw.text((PADDING + 20, y), "暂无玩家在线", fill=SUB_TEXT, font=player_font)
     else:
         for player in players:
             _paste_avatar(img, player.get("avatar_path", ""), (PADDING + 16, y + 2))
-            draw.text((PADDING + 54, y + 6), player.get("name", "Unknown"), fill=TEXT, font=player_font)
+            draw.text(
+                (PADDING + 54, y + 6),
+                player.get("name", "Unknown"),
+                fill=TEXT,
+                font=player_font,
+            )
             y += PLAYER_ROW_H
 
     # 5. 导出

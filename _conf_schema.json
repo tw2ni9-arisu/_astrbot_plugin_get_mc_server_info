@@ -47,6 +47,12 @@
     "hint": "Default 2 (total attempts = 1 + retries). Minimum 0.",
     "default": 2
   },
+  "query_result_cache_ttl_seconds": {
+    "type": "int",
+    "description": "TTL for single-server rendered image cache.",
+    "hint": "Default 10. Repeated single queries within this window return cached image.",
+    "default": 10
+  },
   "skin_api_url_template": {
     "type": "string",
     "description": "Skin API URL template used to fetch skin by UUID.",
