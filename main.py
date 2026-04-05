@@ -49,6 +49,8 @@ TEMPLATE_PATTERN = re.compile(r"^#模板(?:\s+(\S+))?\s*$")
 
 # 默认补全端口（Minecraft Java Edition 常见端口）
 DEFAULT_PORT = 25565
+# 是否自动补全默认端口（可被插件配置覆盖）
+AUTO_APPEND_DEFAULT_PORT = False
 # 静默轮询间隔：30 分钟
 SILENT_QUERY_INTERVAL_SECONDS = 30 * 60
 # 仅保留最近 48 个延迟点（刚好对应 24 小时，30 分钟/点）
@@ -133,6 +135,7 @@ class Main(Star):
         self.avatar_download_concurrency = AVATAR_DOWNLOAD_CONCURRENCY
         self.avatar_download_retries = AVATAR_DOWNLOAD_RETRIES
         self.skin_api_url_template = SKIN_API_URL_TEMPLATE
+        self.auto_append_default_port = AUTO_APPEND_DEFAULT_PORT
 
     async def initialize(self) -> None:
         """插件初始化：创建目录、建立会话、启动后台任务。"""
@@ -854,6 +857,10 @@ class Main(Star):
         self.skin_api_url_template = self._normalize_skin_api_url_template(
             self._get_config_str("skin_api_url_template", SKIN_API_URL_TEMPLATE)
         )
+        self.auto_append_default_port = self._get_config_bool(
+            "auto_append_default_port",
+            AUTO_APPEND_DEFAULT_PORT,
+        )
 
     def _get_config_int(self, key: str, default: int, *, min_value: int = 0) -> int:
         """读取整型配置并做下限保护。"""
@@ -881,6 +888,28 @@ class Main(Star):
             return default
         value = str(raw).strip()
         return value or default
+
+    def _get_config_bool(self, key: str, default: bool) -> bool:
+        """读取布尔配置并兼容常见字符串/数字表示。"""
+        raw = None
+        if hasattr(self._plugin_config, "get"):
+            raw = self._plugin_config.get(key, default)
+        elif isinstance(self._plugin_config, dict):
+            raw = self._plugin_config.get(key, default)
+
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return default
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+
+        text = str(raw).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
 
     @staticmethod
     def _normalize_skin_api_url_template(template: str) -> str:
@@ -956,19 +985,24 @@ class Main(Star):
                 addresses.append(address)
         return addresses
 
-    @staticmethod
-    def _normalize_address(address: str) -> str:
+    def _normalize_address(self, address: str) -> str:
         """标准化服务器地址。
 
-        - 缺省端口时补 25565；
-        - 端口非数字时回退为默认端口。
+        - 当 `auto_append_default_port` 为 True 时：
+          - 缺省端口补 25565；
+          - 端口非数字时回退为默认端口。
+        - 当 `auto_append_default_port` 为 False 时，保持原样。
         """
         address = address.strip()
+        if not address:
+            return address
+        if not self.auto_append_default_port:
+            return address
         if ":" not in address:
             return f"{address}:{DEFAULT_PORT}"
         host, port_str = address.rsplit(":", 1)
         if not port_str.isdigit():
-            return f"{address}:{DEFAULT_PORT}"
+            return f"{host}:{DEFAULT_PORT}"
         return f"{host}:{int(port_str)}"
 
     @staticmethod
