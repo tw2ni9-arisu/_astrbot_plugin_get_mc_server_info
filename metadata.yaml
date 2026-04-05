@@ -1,4 +1,4 @@
-name: _astrbot_plugin_get_mc_server_info
+name: astrbot_plugin_get_mc_server_info
 display_name: 获取 MC 服务器信息
 desc: 会话隔离管理 MC 服务器，支持按名称/地址查询、静默轮询、模板渲染、头像缓存与历史补零。
 version: v1.5.0
