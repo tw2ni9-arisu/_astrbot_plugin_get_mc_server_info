@@ -23,6 +23,12 @@
     "hint": "Default 10. Minimum 1.",
     "default": 10
   },
+  "auto_append_default_port": {
+    "type": "bool",
+    "description": "Whether to append default port 25565 when address has no valid port.",
+    "hint": "Default false. Applies to '#添加服务器' and '#查询服务器 <服务器地址>'.",
+    "default": false
+  },
   "query_all_concurrency": {
     "type": "int",
     "description": "Max concurrent requests for '#查询服务器' (all servers).",
