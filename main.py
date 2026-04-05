@@ -47,11 +47,12 @@ except Exception:
 ADD_SERVER_PATTERN = re.compile(r"^#(?:添加服务器|添加)\s+(\S+)\s+(\S+)\s*$")
 QUERY_SERVER_PATTERN = re.compile(r"^#(?:查询服务器|查询)(?:\s+(\S+))?\s*$")
 DELETE_SERVER_PATTERN = re.compile(r"^#(?:删除服务器|删除)\s+(\S+)\s*$")
+RENAME_SERVER_PATTERN = re.compile(r"^#(?:重命名服务器|重命名)\s+(\S+)\s+(\S+)\s*$")
 LIST_SERVER_PATTERN = re.compile(r"^#(?:服务器列表|列表)\s*$")
 TEMPLATE_PATTERN = re.compile(r"^#模板(?:\s+(\S+))?\s*$")
 HELP_PATTERN = re.compile(r"^#(?:帮助|help)\s*$")
 COMMAND_FALLBACK_PATTERN = re.compile(
-    r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+    r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
 )
 MOTD_FORMAT_CODE_PATTERN = re.compile(r"§.")
 
@@ -216,7 +217,7 @@ class Main(Star):
             yield event.plain_result(self._build_help_message())
             return
 
-        name = matched.group(1).strip()
+        desired_name = matched.group(1).strip()
         raw_address = matched.group(2).strip()
         if not self.auto_append_default_port and self._has_invalid_port_segment(
             raw_address
@@ -242,14 +243,18 @@ class Main(Star):
         async with self._store_lock:
             store = await self._load_store()
             session_obj = self._get_or_create_session(store, session_key)
-            servers = session_obj["servers"]
+            servers: dict[str, dict[str, Any]] = session_obj["servers"]
             if address in servers:
                 yield event.plain_result("添加失败！该服务器已存在")
                 return
+            final_name, name_duplicated = self._resolve_unique_server_name(
+                desired_name,
+                servers,
+            )
 
             now = int(time.time())
             servers[address] = {
-                "name": name,
+                "name": final_name,
                 "address": address,
                 "latency_history": [],
                 "last_latency": status.latency,
@@ -270,7 +275,13 @@ class Main(Star):
         # 4) 尝试缓存图标（失败不影响主流程）+ 触发一次过期清理
         await self._cache_server_icon(address, status.icon_base64)
         await self._cleanup_expired_cache()
-        yield event.plain_result(f"添加成功！服务器 [{name}] 已添加")
+        if name_duplicated:
+            yield event.plain_result(
+                f"名称重复，已自动调整为 [{final_name}]。\n"
+                f"添加成功！服务器 [{final_name}] 已添加"
+            )
+            return
+        yield event.plain_result(f"添加成功！服务器 [{final_name}] 已添加")
 
     @filter.regex(r"^#(?:查询服务器|查询)(?:\s+\S+)?\s*$")
     async def query_server(self, event: AstrMessageEvent):
@@ -373,6 +384,68 @@ class Main(Star):
 
         yield event.plain_result(f"已切换至 {template_name}")
 
+    @filter.regex(r"^#(?:重命名服务器|重命名)\s+\S+\s+\S+\s*$")
+    async def rename_server(self, event: AstrMessageEvent):
+        """重命名当前会话中的服务器：#重命名服务器 <旧名称> <新名称> / #重命名 <旧名称> <新名称>"""
+        if self._should_ignore_self_event(event):
+            return
+
+        matched = RENAME_SERVER_PATTERN.match(event.message_str.strip())
+        if not matched:
+            yield event.plain_result(self._build_help_message())
+            return
+
+        old_name = matched.group(1).strip()
+        new_name = matched.group(2).strip()
+        session_key = event.unified_msg_origin
+
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
+            addresses = self._find_server_addresses_by_name(servers, old_name)
+            if not addresses:
+                yield event.plain_result(
+                    f"重命名失败！当前会话内不存在名为 [{old_name}] 的服务器"
+                )
+                return
+            if len(addresses) > 1:
+                yield event.plain_result(
+                    f"重命名失败！检测到多个同名服务器 [{old_name}]，请先处理重名后再重命名"
+                )
+                return
+
+            address = addresses[0]
+            server_obj = servers.get(address)
+            if not server_obj:
+                yield event.plain_result(
+                    f"重命名失败！当前会话内不存在名为 [{old_name}] 的服务器"
+                )
+                return
+
+            final_name, name_duplicated = self._resolve_unique_server_name(
+                new_name,
+                servers,
+                exclude_address=address,
+            )
+            previous_name = str(server_obj.get("name", "")).strip() or old_name
+            server_obj["name"] = final_name
+            try:
+                await self._save_store(store)
+            except Exception:
+                yield event.plain_result("重命名失败！服务器保存失败，请稍后重试")
+                return
+
+        if name_duplicated:
+            yield event.plain_result(
+                f"名称重复，已自动调整为 [{final_name}]。\n"
+                f"重命名成功！服务器 [{previous_name}] 已重命名为 [{final_name}]"
+            )
+            return
+        yield event.plain_result(
+            f"重命名成功！服务器 [{previous_name}] 已重命名为 [{final_name}]"
+        )
+
     @filter.regex(r"^#(?:删除服务器|删除)\s+\S+\s*$")
     async def delete_server(self, event: AstrMessageEvent):
         """删除当前会话中的服务器：#删除服务器 <服务器名称> / #删除 <服务器名称>"""
@@ -453,7 +526,7 @@ class Main(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.regex(
-        r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+        r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
     )
     async def command_help_and_format_guard(self, event: AstrMessageEvent):
         """命令帮助与格式兜底。"""
@@ -474,6 +547,7 @@ class Main(Star):
             ADD_SERVER_PATTERN,
             QUERY_SERVER_PATTERN,
             DELETE_SERVER_PATTERN,
+            RENAME_SERVER_PATTERN,
             LIST_SERVER_PATTERN,
             TEMPLATE_PATTERN,
         )
@@ -1198,6 +1272,36 @@ class Main(Star):
                 addresses.append(address)
         return addresses
 
+    @staticmethod
+    def _resolve_unique_server_name(
+        desired_name: str,
+        servers: dict[str, dict[str, Any]],
+        *,
+        exclude_address: str | None = None,
+    ) -> tuple[str, bool]:
+        """会话内服务器名称去重，必要时自动追加序号后缀。"""
+        base = desired_name.strip()
+        if not base:
+            base = "未命名服务器"
+
+        existing_names: set[str] = set()
+        for address, server_obj in servers.items():
+            if exclude_address and address == exclude_address:
+                continue
+            existing_name = str(server_obj.get("name", "")).strip()
+            if existing_name:
+                existing_names.add(existing_name)
+
+        if base not in existing_names:
+            return base, False
+
+        index = 1
+        while True:
+            candidate = f"{base}({index})"
+            if candidate not in existing_names:
+                return candidate, True
+            index += 1
+
     def _normalize_address(self, address: str) -> str:
         """标准化服务器地址。
 
@@ -1280,6 +1384,8 @@ class Main(Star):
             "#查询 [服务器名称|服务器地址]\n"
             "#删除服务器 <服务器名称>\n"
             "#删除 <服务器名称>\n"
+            "#重命名服务器 <旧名称> <新名称>\n"
+            "#重命名 <旧名称> <新名称>\n"
             "#服务器列表\n"
             "#列表\n"
             "#模板 [模板名|reload]\n"
