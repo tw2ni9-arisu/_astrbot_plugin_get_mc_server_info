@@ -162,6 +162,7 @@ class Main(Star):
         self.auto_append_default_port = AUTO_APPEND_DEFAULT_PORT
         self.query_result_cache_ttl_seconds = QUERY_RESULT_CACHE_TTL_SECONDS
         self._query_render_cache: dict[str, QueryRenderCacheEntry] = {}
+        self._avatar_file_locks: dict[str, asyncio.Lock] = {}
 
     async def initialize(self) -> None:
         """插件初始化：创建目录、建立会话、启动后台任务。"""
@@ -203,6 +204,7 @@ class Main(Star):
             self._session = None
         self._avatar_download_semaphore = None
         self._query_render_cache.clear()
+        self._avatar_file_locks.clear()
         logger.info("astrbot_plugin_get_mc_server_info terminated.")
 
     @filter.regex(r"^#(?:添加服务器|添加)\s+\S+\s+\S+\s*$")
@@ -330,9 +332,9 @@ class Main(Star):
             return
 
         summary, failures = await self._query_all_servers(event)
-        for failure in failures:
-            yield event.plain_result(failure)
-        yield event.plain_result(summary)
+        messages_to_send = failures + [summary]
+        final_message = "\n".join(messages_to_send)
+        yield event.plain_result(final_message)
 
     @filter.regex(r"^#模板(?:\s+\S+)?\s*$")
     async def switch_template(self, event: AstrMessageEvent):
@@ -839,7 +841,10 @@ class Main(Star):
             address: host:port 形式地址
             need_players: 是否读取在线玩家 sample（主动单服查询时为 True）
         """
-        server = JavaServer.lookup(address)
+        try:
+            server = await JavaServer.async_lookup(address)
+        except Exception as exc:
+            raise RuntimeError("server lookup failed") from exc
 
         try:
             status = await asyncio.wait_for(
@@ -936,11 +941,20 @@ class Main(Star):
                 return {"name": name, "avatar_path": str(avatar_path)}
 
             # 新逻辑：先拉取皮肤图，再用 PILSkinMC 渲染为头像
-            _ = await self._download_and_render_avatar_by_uuid(
-                uid=uid,
-                avatar_path=avatar_path,
-                semaphore=semaphore,
+            file_lock = self._avatar_file_locks.setdefault(
+                str(avatar_path), asyncio.Lock()
             )
+            async with file_lock:
+                if (
+                    avatar_path.exists()
+                    and now - int(avatar_path.stat().st_mtime) <= self.cache_ttl_seconds
+                ):
+                    return {"name": name, "avatar_path": str(avatar_path)}
+                _ = await self._download_and_render_avatar_by_uuid(
+                    uid=uid,
+                    avatar_path=avatar_path,
+                    semaphore=semaphore,
+                )
 
             return {
                 "name": name,
