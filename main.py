@@ -1,14 +1,14 @@
-"""Main plugin workflow for Minecraft server management.
+"""Minecraft 服务器管理的主要插件工作流程。
 
-This module focuses on orchestration and state management:
-1. Session-scoped server storage (group/private isolated).
-2. Periodic silent polling and latency history updates.
-3. Active queries (single/all) and result assembly.
-4. Cache lifecycle management for icon/skin/avatar assets.
-5. Template dispatching for image rendering.
+这个模块主要关注编排和状态管理：
+1. 会话范围的服务器存储（组/私有隔离）。
+2. 定期静默轮询和延迟历史更新。
+3. 活跃查询（单个/全部）及结果组装。
+4. 图标/皮肤/头像资源的缓存生命周期管理。
+5. 图片渲染的模板分发。
 
-Rendering details are delegated to `templates/default_method.py`.
-Persistent data is stored via plugin KV (`get_kv_data` / `put_kv_data`).
+渲染细节委托给 `templates/default_method.py`。
+持久化数据通过插件 KV 存储（`get_kv_data` / `put_kv_data`）。
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import io
 import re
 import shutil
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -84,6 +85,26 @@ SKIN_API_URL_TEMPLATE = "https://skin.mualliance.ltd/api/union/skin/byuuid/{uuid
 QUERY_RESULT_CACHE_TTL_SECONDS = 10
 # 查询渲染缓存清理任务间隔（秒）
 QUERY_CACHE_CLEANUP_INTERVAL_SECONDS = 5 * 60
+# LLM Tool 返回结构版本
+TOOL_VERSION = "1.2"
+PLUGIN_VERSION = "v1.6.0"
+# Tool 查询状态缓存，避免 Agent 连续追问时重复打到 MC 服务端
+TOOL_STATUS_CACHE_TTL_SECONDS = 30
+# Tool 列表缓存，避免 Agent 连续追问列表细节时重复读取存储
+TOOL_LIST_CACHE_TTL_SECONDS = 5
+# Tool 层限流：同一会话窗口内最多允许的工具调用次数
+TOOL_RATE_LIMIT_WINDOW_SECONDS = 60
+TOOL_RATE_LIMIT_MAX_CALLS = 20
+# Tool 层并发查询上限
+TOOL_QUERY_CONCURRENCY = 3
+
+
+class McServerConnectionError(RuntimeError):
+    """MC server lookup/status request failed."""
+
+
+class McServerTimeoutError(McServerConnectionError):
+    """MC server status request timed out."""
 
 
 @dataclass
@@ -118,6 +139,22 @@ class QueryRenderCacheEntry:
 
     expires_at: float
     image_b64: str
+
+
+@dataclass
+class ToolStatusCacheEntry:
+    """LLM Tool 查询状态缓存项。"""
+
+    expires_at: float
+    data: dict[str, Any]
+
+
+@dataclass
+class ToolListCacheEntry:
+    """LLM Tool 列表缓存项。"""
+
+    expires_at: float
+    servers: list[dict[str, Any]]
 
 
 class Main(Star):
@@ -162,6 +199,10 @@ class Main(Star):
         self.auto_append_default_port = AUTO_APPEND_DEFAULT_PORT
         self.query_result_cache_ttl_seconds = QUERY_RESULT_CACHE_TTL_SECONDS
         self._query_render_cache: dict[str, QueryRenderCacheEntry] = {}
+        self._tool_status_cache: dict[str, ToolStatusCacheEntry] = {}
+        self._tool_list_cache: dict[str, ToolListCacheEntry] = {}
+        self._tool_rate_limit_hits: dict[str, list[float]] = {}
+        self._tool_query_semaphore = asyncio.Semaphore(TOOL_QUERY_CONCURRENCY)
         self._avatar_file_locks: dict[str, asyncio.Lock] = {}
 
     async def initialize(self) -> None:
@@ -204,6 +245,9 @@ class Main(Star):
             self._session = None
         self._avatar_download_semaphore = None
         self._query_render_cache.clear()
+        self._tool_status_cache.clear()
+        self._tool_list_cache.clear()
+        self._tool_rate_limit_hits.clear()
         self._avatar_file_locks.clear()
         logger.info("astrbot_plugin_get_mc_server_info terminated.")
 
@@ -221,63 +265,32 @@ class Main(Star):
 
         desired_name = matched.group(1).strip()
         raw_address = matched.group(2).strip()
-        if not self.auto_append_default_port and self._has_invalid_port_segment(
-            raw_address
-        ):
+        result = await self._add_server_data(
+            event.unified_msg_origin,
+            desired_name,
+            raw_address,
+        )
+        if result.get("error") == "INVALID_ADDRESS":
             yield event.plain_result(
                 "添加失败！服务器地址端口无效，请使用 host 或 host:数字端口，"
                 "或在配置中开启 auto_append_default_port。"
             )
             return
-
-        address = self._normalize_address(raw_address)
-        # 以 unified_msg_origin 作为“会话隔离键”
-        session_key = event.unified_msg_origin
-
-        # 2) 先连通性验证，防止不可达服务器进入存储
-        try:
-            status = await self._fetch_server_status(address, need_players=False)
-        except Exception:
+        if result.get("error") == "CONNECTION_FAILED":
             yield event.plain_result("添加失败！服务器连接失败")
             return
+        if result.get("error") == "SERVER_ALREADY_EXISTS":
+            yield event.plain_result("添加失败！该服务器已存在")
+            return
+        if result.get("error") == "SAVE_FAILED":
+            yield event.plain_result("添加失败！服务器保存失败，请稍后重试")
+            return
+        if not result.get("ok"):
+            yield event.plain_result("添加失败！")
+            return
 
-        # 3) 写入存储（加锁）
-        async with self._store_lock:
-            store = await self._load_store()
-            session_obj = self._get_or_create_session(store, session_key)
-            servers: dict[str, dict[str, Any]] = session_obj["servers"]
-            if address in servers:
-                yield event.plain_result("添加失败！该服务器已存在")
-                return
-            final_name, name_duplicated = self._resolve_unique_server_name(
-                desired_name,
-                servers,
-            )
-
-            now = int(time.time())
-            servers[address] = {
-                "name": final_name,
-                "address": address,
-                "latency_history": [],
-                "last_latency": status.latency,
-                "last_silent_query_at": 0,
-                "last_active_query_at": 0,
-                "created_at": now,
-            }
-
-            self._append_latency(servers[address], status.latency, now)
-            try:
-                await self._save_store(store)
-            except Exception:
-                yield event.plain_result("添加失败！服务器保存失败，请稍后重试")
-                return
-
-        self._clear_query_render_cache(session_key, address)
-
-        # 4) 尝试缓存图标（失败不影响主流程）+ 触发一次过期清理
-        await self._cache_server_icon(address, status.icon_base64)
-        await self._cleanup_expired_cache()
-        if name_duplicated:
+        final_name = str(result.get("server", desired_name))
+        if result.get("name_adjusted"):
             yield event.plain_result(
                 f"名称重复，已自动调整为 [{final_name}]。\n"
                 f"添加成功！服务器 [{final_name}] 已添加"
@@ -362,27 +375,19 @@ class Main(Star):
 
         # 手动清理模板缓存：#模板 reload
         if template_name == "reload":
-            self._template_renderer_cache.clear()
+            await self._switch_template_data(event.unified_msg_origin, template_name)
             yield event.plain_result("模板缓存已重载")
             return
 
-        if not self._is_valid_template_name(template_name):
+        result = await self._switch_template_data(
+            event.unified_msg_origin, template_name
+        )
+        if result.get("error") == "TEMPLATE_NOT_FOUND":
             yield event.plain_result("切换失败！未找到模板！")
             return
-
-        try:
-            await self._get_template_renderer(template_name)
-        except Exception as exc:
-            logger.warning("template load failed: %s", exc)
+        if not result.get("ok"):
             yield event.plain_result("切换失败！未找到模板！")
             return
-
-        session_key = event.unified_msg_origin
-        async with self._store_lock:
-            store = await self._load_store()
-            session_obj = self._get_or_create_session(store, session_key)
-            session_obj["template"] = template_name
-            await self._save_store(store)
 
         yield event.plain_result(f"已切换至 {template_name}")
 
@@ -399,46 +404,33 @@ class Main(Star):
 
         old_name = matched.group(1).strip()
         new_name = matched.group(2).strip()
-        session_key = event.unified_msg_origin
-
-        async with self._store_lock:
-            store = await self._load_store()
-            session_obj = self._get_or_create_session(store, session_key)
-            servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
-            addresses = self._find_server_addresses_by_name(servers, old_name)
-            if not addresses:
-                yield event.plain_result(
-                    f"重命名失败！当前会话内不存在名为 [{old_name}] 的服务器"
-                )
-                return
-            if len(addresses) > 1:
-                yield event.plain_result(
-                    f"重命名失败！检测到多个同名服务器 [{old_name}]，请先处理重名后再重命名"
-                )
-                return
-
-            address = addresses[0]
-            server_obj = servers.get(address)
-            if not server_obj:
-                yield event.plain_result(
-                    f"重命名失败！当前会话内不存在名为 [{old_name}] 的服务器"
-                )
-                return
-
-            final_name, name_duplicated = self._resolve_unique_server_name(
-                new_name,
-                servers,
-                exclude_address=address,
+        result = await self._rename_server_data(
+            event.unified_msg_origin,
+            old_name,
+            new_name,
+        )
+        if result.get("error") == "SERVER_NOT_FOUND":
+            yield event.plain_result(
+                f"重命名失败！当前会话内不存在名为 [{old_name}] 的服务器"
             )
-            previous_name = str(server_obj.get("name", "")).strip() or old_name
-            server_obj["name"] = final_name
-            try:
-                await self._save_store(store)
-            except Exception:
-                yield event.plain_result("重命名失败！服务器保存失败，请稍后重试")
-                return
+            return
+        if result.get("error") == "AMBIGUOUS_SERVER_NAME":
+            yield event.plain_result(
+                f"重命名失败！检测到多个同名服务器 [{old_name}]，请先处理重名后再重命名"
+            )
+            return
+        if result.get("error") == "SAVE_FAILED":
+            yield event.plain_result("重命名失败！服务器保存失败，请稍后重试")
+            return
+        if not result.get("ok"):
+            yield event.plain_result(
+                f"重命名失败！当前会话内不存在名为 [{old_name}] 的服务器"
+            )
+            return
 
-        if name_duplicated:
+        previous_name = str(result.get("old_name", old_name))
+        final_name = str(result.get("new_name", new_name))
+        if result.get("name_adjusted"):
             yield event.plain_result(
                 f"名称重复，已自动调整为 [{final_name}]。\n"
                 f"重命名成功！服务器 [{previous_name}] 已重命名为 [{final_name}]"
@@ -460,36 +452,23 @@ class Main(Star):
             return
 
         target_name = matched.group(1).strip()
-        session_key = event.unified_msg_origin
-
-        async with self._store_lock:
-            store = await self._load_store()
-            session_obj = self._get_or_create_session(store, session_key)
-            servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
-            addresses = self._find_server_addresses_by_name(servers, target_name)
-            if not addresses:
-                yield event.plain_result(
-                    f"删除失败！当前会话内不存在名为 [{target_name}] 的服务器"
-                )
-                return
-
-            removed_count = 0
-            for address in addresses:
-                if address in servers:
-                    servers.pop(address)
-                    removed_count += 1
-            try:
-                await self._save_store(store)
-            except Exception:
-                yield event.plain_result("删除失败！服务器保存失败，请稍后重试")
-                return
-
-        for address in addresses:
-            self._clear_query_render_cache(session_key, address)
-            self._delete_server_cache(address)
+        result = await self._delete_server_data(event.unified_msg_origin, target_name)
+        if result.get("error") == "SERVER_NOT_FOUND":
+            yield event.plain_result(
+                f"删除失败！当前会话内不存在名为 [{target_name}] 的服务器"
+            )
+            return
+        if result.get("error") == "SAVE_FAILED":
+            yield event.plain_result("删除失败！服务器保存失败，请稍后重试")
+            return
+        if not result.get("ok"):
+            yield event.plain_result(
+                f"删除失败！当前会话内不存在名为 [{target_name}] 的服务器"
+            )
+            return
 
         yield event.plain_result(
-            f"删除成功！已删除服务器 [{target_name}] 共 {removed_count} 个，并清理对应缓存"
+            f"删除成功！已删除服务器 [{target_name}] 共 {result.get('removed_count', 0)} 个，并清理对应缓存"
         )
 
     @filter.regex(r"^#(?:服务器列表|列表)\s*$")
@@ -503,22 +482,17 @@ class Main(Star):
             yield event.plain_result(self._build_help_message())
             return
 
-        session_key = event.unified_msg_origin
-        async with self._store_lock:
-            store = await self._load_store()
-            session_obj = self._get_or_create_session(store, session_key)
-            servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
-
+        servers = await self._list_servers_data(event.unified_msg_origin)
         if not servers:
             yield event.plain_result("当前会话暂无已添加服务器")
             return
 
         lines: list[str] = []
-        for index, server_obj in enumerate(servers.values(), start=1):
+        for index, server_obj in enumerate(servers, start=1):
             name = str(server_obj.get("name", "Unknown"))
             address = str(server_obj.get("address", "Unknown"))
             try:
-                last_latency = int(server_obj.get("last_latency", 0) or 0)
+                last_latency = int(server_obj.get("latency", 0) or 0)
             except Exception:
                 last_latency = 0
             lines.append(
@@ -557,6 +531,902 @@ class Main(Star):
             return
 
         yield event.plain_result(self._build_help_message())
+
+    @filter.llm_tool(name="query_mc_server")
+    async def query_mc_server_tool(
+        self, event: AstrMessageEvent, server: str
+    ) -> dict[str, Any]:
+        """查询 Minecraft Java 服务器状态。
+
+        当用户询问服务器是否在线、延迟、版本、MOTD、在线人数或最大人数时调用。
+        server 可以是当前会话已保存的服务器名称，也可以是服务器地址。
+
+        Args:
+            server(string): 服务器名称或地址，例如：生存服、Hypixel、play.example.com、play.example.com:25565。
+
+        Examples:
+            生存服
+            Hypixel
+            play.example.com
+
+        不要用于 Minecraft 客户端安装、Java 环境、Mod、插件配置、
+        游戏攻略、账号登录或非服务器状态查询问题。
+        """
+        session_key = event.unified_msg_origin
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            cache_key = self._build_tool_status_cache_key(session_key, server)
+            cached = self._try_get_tool_status_cache(cache_key)
+            if cached is not None:
+                return self._with_tool_meta(cached | {"cached": True})
+            async with self._tool_query_semaphore:
+                result = await self._query_server_data(session_key, server)
+            if result.get("ok"):
+                self._set_tool_status_cache(cache_key, result)
+            return self._with_tool_meta(result | {"cached": False})
+        except Exception as exc:
+            return self._tool_internal_error("query_mc_server", exc)
+
+    @filter.llm_tool(name="add_mc_server")
+    async def add_mc_server_tool(
+        self, event: AstrMessageEvent, name: str, address: str
+    ) -> dict[str, Any]:
+        """添加 Minecraft Java 服务器到当前会话的服务器列表。
+
+        当用户要求添加、保存、记住一个 Minecraft 服务器时调用。
+        不同群聊和私聊使用不同会话，服务器列表互相隔离。
+
+        Args:
+            name(string): 要保存的服务器显示名称，例如：生存服、测试服。
+            address(string): Minecraft Java 服务器地址，可带端口，例如：play.example.com、play.example.com:25565。
+
+        Examples:
+            name=生存服, address=play.example.com
+            name=测试服, address=127.0.0.1:25565
+
+        不要用于查询服务器状态、Minecraft 客户端安装、Java 环境、
+        Mod、插件配置或游戏攻略问题。
+        """
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            return self._with_tool_meta(
+                await self._add_server_data(event.unified_msg_origin, name, address)
+            )
+        except Exception as exc:
+            return self._tool_internal_error("add_mc_server", exc)
+
+    @filter.llm_tool(name="delete_mc_server")
+    async def delete_mc_server_tool(
+        self, event: AstrMessageEvent, server: str
+    ) -> dict[str, Any]:
+        """删除当前会话中已保存的 Minecraft 服务器。
+
+        当用户要求删除、移除、不再保存某个服务器时调用。
+        server 可以是已保存的服务器名称，也可以是精确保存的地址。
+
+        Args:
+            server(string): 服务器名称或精确保存的服务器地址，例如：生存服、play.example.com。
+
+        Examples:
+            生存服
+            play.example.com
+
+        不要用于查询服务器状态、卸载 Minecraft 客户端、删除 Mod、
+        删除 AstrBot 插件或游戏存档管理。
+        """
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            return self._with_tool_meta(
+                await self._delete_server_data(
+                    event.unified_msg_origin, server, idempotent=True
+                )
+            )
+        except Exception as exc:
+            return self._tool_internal_error("delete_mc_server", exc)
+
+    @filter.llm_tool(name="rename_mc_server")
+    async def rename_mc_server_tool(
+        self, event: AstrMessageEvent, old_name: str, new_name: str
+    ) -> dict[str, Any]:
+        """重命名当前会话中已保存的 Minecraft 服务器。
+
+        当用户要求把某个服务器改名、重命名、换显示名称时调用。
+        old_name 可以是已保存的服务器名称，也可以是精确保存的地址。
+
+        Args:
+            old_name(string): 当前服务器名称或精确保存的地址，例如：测试服。
+            new_name(string): 新服务器显示名称，例如：生存服。
+
+        Examples:
+            old_name=测试服, new_name=生存服
+
+        不要用于修改 Minecraft 用户名、服务器地址、Mod 名称、
+        插件名称或非本插件保存的服务器名称。
+        """
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            return self._with_tool_meta(
+                await self._rename_server_data(
+                    event.unified_msg_origin, old_name, new_name
+                )
+            )
+        except Exception as exc:
+            return self._tool_internal_error("rename_mc_server", exc)
+
+    @filter.llm_tool(name="list_mc_servers")
+    async def list_mc_servers_tool(self, event: AstrMessageEvent) -> dict[str, Any]:
+        """列出当前会话中已保存的全部 Minecraft 服务器。
+
+        当用户询问当前保存了哪些服务器、服务器列表、有哪些服时调用。
+
+        Args:
+
+        Examples:
+            列出服务器
+            有哪些服务器
+
+        不要用于查询服务器是否在线、Minecraft 客户端安装、Java 环境、
+        Mod、插件配置或游戏攻略问题。
+        """
+        session_key = event.unified_msg_origin
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            cached_servers = self._try_get_tool_list_cache(session_key)
+            if cached_servers is not None:
+                return self._with_tool_meta(
+                    {
+                        "ok": True,
+                        "servers": cached_servers,
+                        "total": len(cached_servers),
+                        "cached": True,
+                    }
+                )
+            servers = await self._list_servers_data(session_key)
+            self._set_tool_list_cache(session_key, servers)
+            return self._with_tool_meta(
+                {
+                    "ok": True,
+                    "servers": servers,
+                    "total": len(servers),
+                    "cached": False,
+                }
+            )
+        except Exception as exc:
+            return self._tool_internal_error("list_mc_servers", exc)
+
+    @filter.llm_tool(name="switch_mc_template")
+    async def switch_mc_template_tool(
+        self, event: AstrMessageEvent, template: str
+    ) -> dict[str, Any]:
+        """切换当前会话的 Minecraft 查询图片渲染模板。
+
+        当用户要求把模板切换为某个模板，或更换查询图片样式时调用。
+
+        Args:
+            template(string): 模板名称，不包含 .py 后缀，例如：default_method。
+
+        Examples:
+            default_method
+            reload
+
+        不要用于切换 Minecraft 客户端版本、Java 版本、材质包、
+        光影包、Mod 或服务器自身插件。
+        """
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            return self._with_tool_meta(
+                await self._switch_template_data(event.unified_msg_origin, template)
+            )
+        except Exception as exc:
+            return self._tool_internal_error("switch_mc_template", exc)
+
+    @filter.llm_tool(name="resolve_server_name")
+    async def resolve_server_name_tool(
+        self, event: AstrMessageEvent, hint: str = ""
+    ) -> dict[str, Any]:
+        """根据用户的模糊说法解析当前会话里可能指向的服务器。
+
+        当用户说“刚才那个服”“昨天那个服”“第一个服”“生存相关的服”
+        等模糊指代，而模型需要先查看当前会话保存的服务器候选时调用。
+        返回结果按最近查询时间和创建时间排序，便于模型选择。
+
+        Args:
+            hint(string): 用户给出的模糊线索，可以为空，例如：昨天那个服、生存、第一个。
+
+        Examples:
+            昨天那个服
+            生存
+            第一个
+
+        不要用于直接查询服务器在线状态；确认具体服务器后再调用
+        query_mc_server。
+        """
+        session_key = event.unified_msg_origin
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            candidates = await self._resolve_server_name_data(session_key, hint)
+            return self._with_tool_meta(
+                {
+                    "ok": True,
+                    "hint": hint,
+                    "candidates": candidates,
+                    "total": len(candidates),
+                }
+            )
+        except Exception as exc:
+            return self._tool_internal_error("resolve_server_name", exc)
+
+    def _check_tool_rate_limit(self, actor_key: str) -> dict[str, Any] | None:
+        """Apply a small per-sender rate limit for LLM tool calls."""
+        now = time.monotonic()
+        window_start = now - TOOL_RATE_LIMIT_WINDOW_SECONDS
+        hits = [
+            hit
+            for hit in self._tool_rate_limit_hits.get(actor_key, [])
+            if hit >= window_start
+        ]
+        self._tool_rate_limit_hits[actor_key] = hits
+        if len(hits) >= TOOL_RATE_LIMIT_MAX_CALLS:
+            return self._with_tool_meta(
+                {
+                    "ok": False,
+                    "error": "RATE_LIMITED",
+                    "message": "tool call rate limit exceeded for this sender",
+                }
+            )
+        hits.append(now)
+        return None
+
+    def _build_tool_actor_key(self, event: AstrMessageEvent) -> str:
+        sender_id = self._get_event_sender_id(event)
+        if not sender_id:
+            sender_id = "unknown"
+        return f"{event.unified_msg_origin}|{sender_id}"
+
+    @staticmethod
+    def _get_event_sender_id(event: AstrMessageEvent) -> str:
+        try:
+            sender_getter = getattr(event, "get_sender_id", None)
+            if callable(sender_getter):
+                return str(sender_getter() or "").strip()
+            sender = getattr(getattr(event, "message_obj", None), "sender", None)
+            return str(getattr(sender, "user_id", "") or "").strip()
+        except Exception:
+            return ""
+
+    def _build_tool_status_cache_key(self, session_key: str, server: str) -> str:
+        return f"{session_key}|{self._normalize_tool_server_token(server)}"
+
+    def _normalize_tool_server_token(self, server: str) -> str:
+        token = (server or "").strip().lower().rstrip(":")
+        if not token:
+            return token
+        return self._normalize_address(token)
+
+    def _try_get_tool_status_cache(self, cache_key: str) -> dict[str, Any] | None:
+        now = time.time()
+        entry = self._tool_status_cache.get(cache_key)
+        if not entry:
+            return None
+        if entry.expires_at <= now:
+            self._tool_status_cache.pop(cache_key, None)
+            return None
+        return dict(entry.data)
+
+    def _set_tool_status_cache(self, cache_key: str, data: dict[str, Any]) -> None:
+        self._tool_status_cache[cache_key] = ToolStatusCacheEntry(
+            expires_at=time.time() + TOOL_STATUS_CACHE_TTL_SECONDS,
+            data=dict(data),
+        )
+
+    def _try_get_tool_list_cache(self, session_key: str) -> list[dict[str, Any]] | None:
+        now = time.time()
+        entry = self._tool_list_cache.get(session_key)
+        if not entry:
+            return None
+        if entry.expires_at <= now:
+            self._tool_list_cache.pop(session_key, None)
+            return None
+        return [dict(server) for server in entry.servers]
+
+    def _set_tool_list_cache(
+        self, session_key: str, servers: list[dict[str, Any]]
+    ) -> None:
+        self._tool_list_cache[session_key] = ToolListCacheEntry(
+            expires_at=time.time() + TOOL_LIST_CACHE_TTL_SECONDS,
+            servers=[dict(server) for server in servers],
+        )
+
+    def _clear_tool_status_cache(self, session_key: str) -> None:
+        prefix = f"{session_key}|"
+        for key in list(self._tool_status_cache.keys()):
+            if key.startswith(prefix):
+                self._tool_status_cache.pop(key, None)
+
+    def _clear_tool_list_cache(self, session_key: str) -> None:
+        self._tool_list_cache.pop(session_key, None)
+
+    def _cleanup_tool_caches(self) -> int:
+        now = time.time()
+        removed = 0
+        for key, entry in list(self._tool_status_cache.items()):
+            if entry.expires_at <= now:
+                self._tool_status_cache.pop(key, None)
+                removed += 1
+        for key, entry in list(self._tool_list_cache.items()):
+            if entry.expires_at <= now:
+                self._tool_list_cache.pop(key, None)
+                removed += 1
+        return removed
+
+    @staticmethod
+    def _is_retryable_tool_error(error: str | None) -> bool:
+        return error in {
+            "CONNECTION_FAILED",
+            "CONNECTION_TIMEOUT",
+            "RATE_LIMITED",
+            "SAVE_FAILED",
+            "INTERNAL_ERROR",
+        }
+
+    def _with_tool_meta(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize LLM Tool responses while keeping existing adapter fields."""
+        normalized = dict(data)
+        ok = bool(normalized.get("ok", False))
+        error = str(normalized.get("error", "") or "")
+        normalized.setdefault("success", ok)
+        if ok:
+            if "online" in normalized:
+                normalized.setdefault(
+                    "status", "online" if normalized["online"] else "offline"
+                )
+            else:
+                normalized.setdefault("status", "ok")
+        else:
+            normalized.setdefault("status", "error")
+            normalized.setdefault("retryable", self._is_retryable_tool_error(error))
+        normalized.setdefault("tool_version", TOOL_VERSION)
+        normalized.setdefault("plugin_version", PLUGIN_VERSION)
+        normalized.setdefault("request_id", uuid.uuid4().hex)
+        return normalized
+
+    def _tool_internal_error(self, tool_name: str, exc: Exception) -> dict[str, Any]:
+        logger.exception("%s failed with internal error: %s", tool_name, exc)
+        return self._with_tool_meta(
+            {
+                "ok": False,
+                "error": "INTERNAL_ERROR",
+                "message": "tool internal error",
+            }
+        )
+
+    async def _query_server_data(self, session_key: str, server: str) -> dict[str, Any]:
+        """Query server data for LLM tools without rendering images."""
+        query_token = (server or "").strip()
+        if not query_token:
+            return {
+                "ok": False,
+                "online": False,
+                "error": "INVALID_ARGUMENT",
+                "message": "server is required",
+            }
+
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
+
+        matched_addresses = self._find_server_addresses_by_name(servers, query_token)
+        if len(matched_addresses) > 1:
+            return {
+                "ok": False,
+                "online": False,
+                "server": query_token,
+                "error": "AMBIGUOUS_SERVER_NAME",
+                "message": "multiple saved servers use this name; query by address",
+            }
+
+        managed = len(matched_addresses) == 1
+        address = (
+            matched_addresses[0] if managed else self._normalize_address(query_token)
+        )
+        saved_server = servers.get(address, {})
+        display_name = str(
+            saved_server.get("name", query_token if managed else address)
+        )
+
+        try:
+            status = await self._fetch_server_status(address, need_players=False)
+        except McServerTimeoutError:
+            return {
+                "ok": False,
+                "online": False,
+                "server": display_name,
+                "address": address,
+                "managed": managed,
+                "error": "CONNECTION_TIMEOUT",
+                "message": "server connection timed out",
+            }
+        except McServerConnectionError:
+            return {
+                "ok": False,
+                "online": False,
+                "server": display_name,
+                "address": address,
+                "managed": managed,
+                "error": "CONNECTION_FAILED",
+                "message": "server connection failed",
+            }
+
+        now = int(time.time())
+        await self._cache_server_icon(address, status.icon_base64)
+
+        if managed:
+            async with self._store_lock:
+                store = await self._load_store()
+                session_obj = self._get_or_create_session(store, session_key)
+                real_server_obj = session_obj["servers"].get(address)
+                if not real_server_obj:
+                    return {
+                        "ok": False,
+                        "online": False,
+                        "server": display_name,
+                        "address": address,
+                        "managed": True,
+                        "error": "SERVER_NOT_FOUND",
+                        "message": "saved server no longer exists",
+                    }
+                real_server_obj["last_latency"] = status.latency
+                real_server_obj["last_active_query_at"] = now
+                self._append_latency(real_server_obj, status.latency, now)
+                await self._save_store(store)
+            self._clear_tool_list_cache(session_key)
+
+        await self._cleanup_expired_cache()
+        return self._server_status_to_tool_data(
+            status,
+            server_name=display_name,
+            address=address,
+            managed=managed,
+        )
+
+    async def _add_server_data(
+        self, session_key: str, name: str, raw_address: str
+    ) -> dict[str, Any]:
+        """Add a server and return structured data for LLM tools."""
+        desired_name = (name or "").strip()
+        raw_address = (raw_address or "").strip()
+        if not desired_name or not raw_address:
+            return {
+                "ok": False,
+                "error": "INVALID_ARGUMENT",
+                "message": "name and address are required",
+            }
+        if not self.auto_append_default_port and self._has_invalid_port_segment(
+            raw_address
+        ):
+            return {
+                "ok": False,
+                "server": desired_name,
+                "address": raw_address,
+                "error": "INVALID_ADDRESS",
+                "message": "server address port is invalid",
+            }
+
+        address = self._normalize_address(raw_address)
+        try:
+            status = await self._fetch_server_status(address, need_players=False)
+        except McServerTimeoutError:
+            return {
+                "ok": False,
+                "server": desired_name,
+                "address": address,
+                "error": "CONNECTION_TIMEOUT",
+                "message": "server connection timed out",
+            }
+        except McServerConnectionError:
+            return {
+                "ok": False,
+                "server": desired_name,
+                "address": address,
+                "error": "CONNECTION_FAILED",
+                "message": "server connection failed",
+            }
+
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = session_obj["servers"]
+            if address in servers:
+                return {
+                    "ok": False,
+                    "server": str(servers[address].get("name", desired_name)),
+                    "address": address,
+                    "error": "SERVER_ALREADY_EXISTS",
+                    "message": "server already exists",
+                }
+
+            final_name, name_duplicated = self._resolve_unique_server_name(
+                desired_name,
+                servers,
+            )
+            now = int(time.time())
+            servers[address] = {
+                "name": final_name,
+                "address": address,
+                "latency_history": [],
+                "last_latency": status.latency,
+                "last_silent_query_at": 0,
+                "last_active_query_at": 0,
+                "created_at": now,
+            }
+            self._append_latency(servers[address], status.latency, now)
+            try:
+                await self._save_store(store)
+            except Exception as exc:
+                logger.exception("save server failed: %s", exc)
+                return {
+                    "ok": False,
+                    "server": final_name,
+                    "address": address,
+                    "error": "SAVE_FAILED",
+                    "message": "server save failed",
+                }
+
+        self._clear_query_render_cache(session_key, address)
+        self._clear_tool_status_cache(session_key)
+        self._clear_tool_list_cache(session_key)
+        await self._cache_server_icon(address, status.icon_base64)
+        await self._cleanup_expired_cache()
+        return {
+            "ok": True,
+            "server": final_name,
+            "requested_name": desired_name,
+            "address": address,
+            "name_adjusted": name_duplicated,
+            "latency": status.latency,
+            "players_online": status.players_online,
+            "players_max": status.players_max,
+            "version": status.version,
+            "motd": status.motd,
+        }
+
+    async def _delete_server_data(
+        self, session_key: str, server: str, *, idempotent: bool = False
+    ) -> dict[str, Any]:
+        """Delete saved servers and return structured data for LLM tools."""
+        target = (server or "").strip()
+        if not target:
+            return {
+                "ok": False,
+                "error": "INVALID_ARGUMENT",
+                "message": "server is required",
+            }
+
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
+            addresses = self._find_server_addresses_by_name(servers, target)
+            if not addresses and target in servers:
+                addresses = [target]
+            if not addresses:
+                if idempotent:
+                    return {
+                        "ok": True,
+                        "server": target,
+                        "removed_count": 0,
+                        "removed": [],
+                        "already_deleted": True,
+                        "message": "saved server already absent",
+                    }
+                return {
+                    "ok": False,
+                    "server": target,
+                    "error": "SERVER_NOT_FOUND",
+                    "message": "saved server not found in current session",
+                }
+
+            removed: list[dict[str, Any]] = []
+            for address in addresses:
+                server_obj = servers.pop(address, None)
+                if server_obj:
+                    removed.append(
+                        {
+                            "name": str(server_obj.get("name", target)),
+                            "address": address,
+                        }
+                    )
+            try:
+                await self._save_store(store)
+            except Exception as exc:
+                logger.exception("delete server save failed: %s", exc)
+                return {
+                    "ok": False,
+                    "server": target,
+                    "error": "SAVE_FAILED",
+                    "message": "server save failed",
+                }
+
+        for address in addresses:
+            self._clear_query_render_cache(session_key, address)
+            self._delete_server_cache(address)
+        self._clear_tool_status_cache(session_key)
+        self._clear_tool_list_cache(session_key)
+
+        return {
+            "ok": True,
+            "server": target,
+            "removed_count": len(removed),
+            "removed": removed,
+        }
+
+    async def _rename_server_data(
+        self, session_key: str, old_name: str, new_name: str
+    ) -> dict[str, Any]:
+        """Rename a saved server and return structured data for LLM tools."""
+        old_name = (old_name or "").strip()
+        new_name = (new_name or "").strip()
+        if not old_name or not new_name:
+            return {
+                "ok": False,
+                "error": "INVALID_ARGUMENT",
+                "message": "old_name and new_name are required",
+            }
+
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
+            addresses = self._find_server_addresses_by_name(servers, old_name)
+            if not addresses and old_name in servers:
+                addresses = [old_name]
+            if not addresses:
+                return {
+                    "ok": False,
+                    "server": old_name,
+                    "error": "SERVER_NOT_FOUND",
+                    "message": "saved server not found in current session",
+                }
+            if len(addresses) > 1:
+                return {
+                    "ok": False,
+                    "server": old_name,
+                    "error": "AMBIGUOUS_SERVER_NAME",
+                    "message": "multiple saved servers use this name",
+                }
+
+            address = addresses[0]
+            server_obj = servers.get(address)
+            if not server_obj:
+                return {
+                    "ok": False,
+                    "server": old_name,
+                    "address": address,
+                    "error": "SERVER_NOT_FOUND",
+                    "message": "saved server not found in current session",
+                }
+
+            previous_name = str(server_obj.get("name", "")).strip() or old_name
+            final_name, name_duplicated = self._resolve_unique_server_name(
+                new_name,
+                servers,
+                exclude_address=address,
+            )
+            server_obj["name"] = final_name
+            try:
+                await self._save_store(store)
+            except Exception as exc:
+                logger.exception("rename server save failed: %s", exc)
+                return {
+                    "ok": False,
+                    "server": old_name,
+                    "address": address,
+                    "error": "SAVE_FAILED",
+                    "message": "server save failed",
+                }
+
+        self._clear_tool_status_cache(session_key)
+        self._clear_tool_list_cache(session_key)
+        return {
+            "ok": True,
+            "address": address,
+            "old_name": previous_name,
+            "new_name": final_name,
+            "requested_new_name": new_name,
+            "name_adjusted": name_duplicated,
+        }
+
+    async def _list_servers_data(self, session_key: str) -> list[dict[str, Any]]:
+        """List saved servers as JSON-serializable data for LLM tools."""
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
+
+        results: list[dict[str, Any]] = []
+        for server_obj in servers.values():
+            try:
+                last_latency = int(server_obj.get("last_latency", 0) or 0)
+            except Exception:
+                last_latency = 0
+            results.append(
+                {
+                    "name": str(server_obj.get("name", "Unknown")),
+                    "address": str(server_obj.get("address", "Unknown")),
+                    "latency": max(last_latency, 0),
+                }
+            )
+        return results
+
+    async def _resolve_server_name_data(
+        self, session_key: str, hint: str
+    ) -> list[dict[str, Any]]:
+        """Return saved server candidates ordered for fuzzy reference resolution."""
+        hint_text = (hint or "").strip().lower()
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
+
+        candidates: list[dict[str, Any]] = []
+        for server_obj in servers.values():
+            name = str(server_obj.get("name", "Unknown"))
+            address = str(server_obj.get("address", "Unknown"))
+            try:
+                last_latency = int(server_obj.get("last_latency", 0) or 0)
+            except Exception:
+                last_latency = 0
+            try:
+                last_active_query_at = int(
+                    server_obj.get("last_active_query_at", 0) or 0
+                )
+            except Exception:
+                last_active_query_at = 0
+            try:
+                last_silent_query_at = int(
+                    server_obj.get("last_silent_query_at", 0) or 0
+                )
+            except Exception:
+                last_silent_query_at = 0
+            try:
+                created_at = int(server_obj.get("created_at", 0) or 0)
+            except Exception:
+                created_at = 0
+
+            haystack = f"{name} {address}".lower()
+            score = 0
+            if hint_text and hint_text in haystack:
+                score += 100
+            if hint_text and name.lower().startswith(hint_text):
+                score += 50
+            recent_ts = max(last_active_query_at, last_silent_query_at, created_at)
+            candidates.append(
+                {
+                    "name": name,
+                    "address": address,
+                    "latency": max(last_latency, 0),
+                    "last_active_query_at": last_active_query_at,
+                    "last_silent_query_at": last_silent_query_at,
+                    "created_at": created_at,
+                    "score": score,
+                    "matched": bool(score),
+                    "recent_ts": recent_ts,
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                int(item.get("score", 0) or 0),
+                int(item.get("recent_ts", 0) or 0),
+            ),
+            reverse=True,
+        )
+        return candidates[:10]
+
+    async def _switch_template_data(
+        self, session_key: str, template: str
+    ) -> dict[str, Any]:
+        """Switch template and return structured data for LLM tools."""
+        template_name = (template or "").strip()
+        if not template_name:
+            return {
+                "ok": False,
+                "error": "INVALID_ARGUMENT",
+                "message": "template is required",
+                "available_templates": self._list_templates(),
+            }
+        if template_name == "reload":
+            self._template_renderer_cache.clear()
+            return {
+                "ok": True,
+                "template": template_name,
+                "reloaded": True,
+                "available_templates": self._list_templates(),
+            }
+        if not self._is_valid_template_name(template_name):
+            return {
+                "ok": False,
+                "template": template_name,
+                "error": "TEMPLATE_NOT_FOUND",
+                "message": "template not found",
+                "available_templates": self._list_templates(),
+            }
+
+        try:
+            await self._get_template_renderer(template_name)
+        except Exception as exc:
+            logger.warning("template load failed: %s", exc)
+            return {
+                "ok": False,
+                "template": template_name,
+                "error": "TEMPLATE_NOT_FOUND",
+                "message": "template not found",
+                "available_templates": self._list_templates(),
+            }
+
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            current_template = str(
+                session_obj.get("template", DEFAULT_TEMPLATE_NAME)
+                or DEFAULT_TEMPLATE_NAME
+            )
+            if current_template == template_name:
+                return {
+                    "ok": True,
+                    "template": template_name,
+                    "already_active": True,
+                    "message": "template already active",
+                }
+            session_obj["template"] = template_name
+            try:
+                await self._save_store(store)
+            except Exception as exc:
+                logger.exception("switch template save failed: %s", exc)
+                return {
+                    "ok": False,
+                    "template": template_name,
+                    "error": "SAVE_FAILED",
+                    "message": "template save failed",
+                }
+
+        return {"ok": True, "template": template_name, "already_active": False}
+
+    @staticmethod
+    def _server_status_to_tool_data(
+        status: ServerStatus,
+        *,
+        server_name: str,
+        address: str,
+        managed: bool,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "server": server_name,
+            "address": address,
+            "managed": managed,
+            "online": True,
+            "latency": status.latency,
+            "players_online": status.players_online,
+            "players_max": status.players_max,
+            "version": status.version,
+            "motd": status.motd,
+        }
 
     async def _query_single_server(self, event: AstrMessageEvent, address: str):
         """主动查询单个服务器并返回渲染图。
@@ -843,15 +1713,23 @@ class Main(Star):
         """
         try:
             server = await JavaServer.async_lookup(address)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise McServerTimeoutError("server lookup timed out") from exc
+        except OSError as exc:
+            raise McServerConnectionError("server lookup failed") from exc
         except Exception as exc:
-            raise RuntimeError("server lookup failed") from exc
+            raise McServerConnectionError("server lookup failed") from exc
 
         try:
             status = await asyncio.wait_for(
                 server.async_status(), timeout=self.status_timeout_seconds
             )
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise McServerTimeoutError("server status timed out") from exc
+        except (OSError, ConnectionError) as exc:
+            raise McServerConnectionError("server status failed") from exc
         except Exception as exc:
-            raise RuntimeError("server status failed") from exc
+            raise McServerConnectionError("server status failed") from exc
 
         # favicon 通常是 data:image/png;base64,xxxxx
         icon_base64 = None
@@ -1491,17 +2369,15 @@ class Main(Star):
         return removed
 
     async def _query_render_cache_cleanup_loop(self) -> None:
-        """定期清理查询渲染缓存中的过期条目。"""
+        """定期清理查询渲染缓存和 LLM Tool 缓存中的过期条目。"""
         while True:
             try:
                 removed = self._cleanup_query_render_cache()
+                removed += self._cleanup_tool_caches()
                 if removed:
-                    logger.debug(
-                        "cleaned %s expired query render cache entries",
-                        removed,
-                    )
+                    logger.debug("cleaned %s expired cache entries", removed)
             except Exception as exc:
-                logger.debug("query render cache cleanup failed: %s", exc)
+                logger.debug("cache cleanup failed: %s", exc)
             await asyncio.sleep(QUERY_CACHE_CLEANUP_INTERVAL_SECONDS)
 
     def _extract_motd_text(self, description: Any) -> str:
