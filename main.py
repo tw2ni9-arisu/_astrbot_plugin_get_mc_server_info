@@ -40,6 +40,17 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
+# ---- 模块化拆分导入 ----
+from . import store as _store_mod
+from . import cache as _cache_mod
+from . import query as _query_mod
+from . import avatar as _avatar_mod
+from . import template_loader as _tl_mod
+ServerStatus = _query_mod.ServerStatus
+McServerConnectionError = _query_mod.McServerConnectionError
+McServerTimeoutError = _query_mod.McServerTimeoutError
+MOTD_FORMAT_CODE_PATTERN = _query_mod.MOTD_FORMAT_CODE_PATTERN
+
 try:
     import PILSkinMC as _PILSKINMC
 except Exception:
@@ -51,11 +62,11 @@ DELETE_SERVER_PATTERN = re.compile(r"^#(?:删除服务器|删除)\s+(\S+)\s*$")
 RENAME_SERVER_PATTERN = re.compile(r"^#(?:重命名服务器|重命名)\s+(\S+)\s+(\S+)\s*$")
 LIST_SERVER_PATTERN = re.compile(r"^#(?:服务器列表|列表)\s*$")
 TEMPLATE_PATTERN = re.compile(r"^#模板(?:\s+(\S+))?\s*$")
+REDIRECT_SERVER_PATTERN = re.compile(r"^#重定向\s+(\S+)\s+(\S+)\s*$")
 HELP_PATTERN = re.compile(r"^#(?:帮助|help)\s*$")
 COMMAND_FALLBACK_PATTERN = re.compile(
-    r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+    r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
 )
-MOTD_FORMAT_CODE_PATTERN = re.compile(r"§.")
 
 # 默认补全端口（Minecraft Java Edition 常见端口）
 DEFAULT_PORT = 25565
@@ -99,30 +110,10 @@ TOOL_RATE_LIMIT_MAX_CALLS = 20
 TOOL_QUERY_CONCURRENCY = 3
 
 
-class McServerConnectionError(RuntimeError):
-    """MC server lookup/status request failed."""
+# McServerConnectionError / McServerTimeoutError → 已迁移到 query.py
 
 
-class McServerTimeoutError(McServerConnectionError):
-    """MC server status request timed out."""
-
-
-@dataclass
-class ServerStatus:
-    """标准化后的服务器状态结构。
-
-    该数据类是查询层和业务层之间的统一数据载体，
-    避免后续逻辑直接依赖 mcstatus 的原始对象结构。
-    """
-
-    address: str
-    latency: int
-    version: str
-    players_online: int
-    players_max: int
-    icon_base64: str | None
-    players: list[dict[str, str]]
-    motd: str
+# ServerStatus → 已迁移到 query.py
 
 
 @dataclass
@@ -334,10 +325,12 @@ class Main(Star):
                 yield await self._query_single_server(event, matched_addresses[0])
                 return
 
-            # 未命中已添加的服务器名称时，按地址直接进行一次主动查询：
-            # - 不写入会话服务器列表
-            # - 不拉取/缓存玩家头像
-            # - 仅渲染并返回本次查询结果
+            # 未命中已添加的服务器名称时，尝试按地址直连查询；
+            # 若输入看起来是名称而非地址，则直接反馈不存在。
+            if "." not in query_token and ":" not in query_token:
+                yield event.plain_result(f"当前会话内不存在名为 [{query_token}] 的服务器")
+                return
+
             yield await self._query_direct_address(
                 event,
                 self._normalize_address(query_token),
@@ -502,7 +495,7 @@ class Main(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.regex(
-        r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+        r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
     )
     async def command_help_and_format_guard(self, event: AstrMessageEvent):
         """命令帮助与格式兜底。"""
@@ -526,11 +519,38 @@ class Main(Star):
             RENAME_SERVER_PATTERN,
             LIST_SERVER_PATTERN,
             TEMPLATE_PATTERN,
+            REDIRECT_SERVER_PATTERN,
         )
         if any(pattern.match(message) for pattern in valid_patterns):
             return
 
         yield event.plain_result(self._build_help_message())
+
+    @filter.regex(r"^#重定向\s+\S+\s+\S+\s*$")
+    async def redirect_server(self, event: AstrMessageEvent):
+        """重定向 MC 服务器地址：#重定向 <服务器名称> <新地址>"""
+        if self._should_ignore_self_event(event):
+            return
+        matched = REDIRECT_SERVER_PATTERN.match(event.message_str.strip())
+        if not matched:
+            yield event.plain_result(self._build_help_message())
+            return
+        server_name = matched.group(1).strip()
+        new_raw_address = matched.group(2).strip()
+        result = await self._redirect_server_data(event.unified_msg_origin, server_name, new_raw_address)
+        if result.get("error") == "SERVER_NOT_FOUND":
+            yield event.plain_result(f'重定向失败！服务器 "{server_name}" 不存在')
+            return
+        if result.get("error") == "CONNECTION_FAILED":
+            yield event.plain_result("重定向失败！新地址无法连接")
+            return
+        if result.get("error") == "INVALID_ADDRESS":
+            yield event.plain_result("重定向失败！新地址端口无效")
+            return
+        if not result.get("ok"):
+            yield event.plain_result("重定向失败！")
+            return
+        yield event.plain_result(f"{result['server_name']} 重定向 {result['old_address']} -> {result['new_address']}，新地址延迟: {result['latency']} ms")
 
     @filter.llm_tool(name="query_mc_server")
     async def query_mc_server_tool(
@@ -769,6 +789,24 @@ class Main(Star):
             )
         except Exception as exc:
             return self._tool_internal_error("resolve_server_name", exc)
+
+    @filter.llm_tool(name="redirect_mc_server")
+    async def redirect_mc_server_tool(self, event: AstrMessageEvent, name: str, new_address: str) -> dict[str, Any]:
+        """重定向已保存的 Minecraft 服务器到新地址。更换前会先验证新地址能否连接。
+
+        Args:
+            name(string): 当前会话中已保存的服务器名称
+            new_address(string): 新的服务器地址
+        """
+        session_key = event.unified_msg_origin
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            result = await self._redirect_server_data(session_key, name, new_address)
+            return self._with_tool_meta(result)
+        except Exception as exc:
+            return self._tool_internal_error("redirect_mc_server", exc)
 
     def _check_tool_rate_limit(self, actor_key: str) -> dict[str, Any] | None:
         """Apply a small per-sender rate limit for LLM tool calls."""
@@ -1251,6 +1289,81 @@ class Main(Star):
             "name_adjusted": name_duplicated,
         }
 
+    async def _redirect_server_data(self, session_key: str, server_name: str, new_raw_address: str) -> dict[str, Any]:
+        """重定向已保存服务器到新地址（先验证新地址可连再更新）。"""
+        server_name = (server_name or "").strip()
+        new_raw_address = (new_raw_address or "").strip()
+        if not server_name or not new_raw_address:
+            return {"ok": False, "error": "INVALID_ARGUMENT",
+                    "message": "name and new_address are required"}
+        new_address = self._normalize_address(new_raw_address)
+        if not self.auto_append_default_port and self._has_invalid_port_segment(new_raw_address):
+            return {"ok": False, "error": "INVALID_ADDRESS",
+                    "message": "new address port is invalid"}
+
+        # 1) 先在锁内查服务器信息，但不在锁内做网络 I/O
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers = session_obj["servers"]
+            matched = self._find_server_addresses_by_name(servers, server_name)
+            if not matched:
+                return {"ok": False, "server_name": server_name,
+                        "error": "SERVER_NOT_FOUND",
+                        "message": f"server '{server_name}' not found"}
+            old_address = matched[0]
+            old_server = dict(servers[old_address])  # 浅拷贝，避免持锁操作
+
+        # 2) 锁外验证新地址（网络 I/O，不阻塞其他操作）
+        try:
+            status = await self._fetch_server_status(new_address, need_players=False)
+        except McServerTimeoutError:
+            return {"ok": False, "server_name": server_name,
+                    "error": "CONNECTION_FAILED",
+                    "message": "new address connection timed out"}
+        except McServerConnectionError:
+            return {"ok": False, "server_name": server_name,
+                    "error": "CONNECTION_FAILED",
+                    "message": "new address connection failed"}
+
+        # 3) 锁内快速写入
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers = session_obj["servers"]
+
+            # 二次校验：服务器是否仍存在
+            if old_address not in servers:
+                return {"ok": False, "server_name": server_name,
+                        "error": "SERVER_NOT_FOUND",
+                        "message": "server was removed during redirect"}
+
+            # 地址冲突检测
+            if new_address != old_address and new_address in servers:
+                conflict_name = servers[new_address].get("name", new_address)
+                return {"ok": False, "server_name": server_name,
+                        "error": "SERVER_ALREADY_EXISTS",
+                        "message": f"new address already used by '{conflict_name}'"}
+
+            del servers[old_address]
+            servers[new_address] = old_server
+            servers[new_address]["address"] = new_address
+            try:
+                await self._save_store(store)
+            except Exception as exc:
+                logger.exception("redirect save failed: %s", exc)
+                return {"ok": False, "server_name": server_name,
+                        "error": "SAVE_FAILED",
+                        "message": "server save failed"}
+
+        self._clear_tool_status_cache(session_key)
+        self._clear_tool_list_cache(session_key)
+        self._clear_query_render_cache(session_key, old_address)
+        return {"ok": True,
+                "server_name": old_server.get("name", server_name),
+                "old_address": old_address, "new_address": new_address,
+                "latency": status.latency}
+
     async def _list_servers_data(self, session_key: str) -> list[dict[str, Any]]:
         """List saved servers as JSON-serializable data for LLM tools."""
         async with self._store_lock:
@@ -1538,13 +1651,15 @@ class Main(Star):
             )
 
         try:
-            # 地址直连查询不拉取玩家 sample，避免触发头像下载链路。
-            status = await self._fetch_server_status(address, need_players=False)
+            status = await self._fetch_server_status(address, need_players=True)
         except Exception:
             return event.plain_result(f"服务器 [{address}] 查询失败！")
 
         now = int(time.time())
         await self._cache_server_icon(address, status.icon_base64)
+        players_for_render = await self._cache_and_collect_player_avatars(
+            address, status.players,
+        )
         await self._cleanup_expired_cache()
 
         icon_path = self._icon_cache_path(address)
@@ -1561,7 +1676,7 @@ class Main(Star):
             history=self._build_render_history([], now_ts=now),
             history_title=self._build_history_title(),
             icon_path=str(icon_path) if icon_path.exists() else None,
-            players=[],
+            players=players_for_render,
         )
         self._set_query_render_cache(cache_key, image_b64)
         return event.make_result().base64_image(image_b64)
@@ -1749,7 +1864,18 @@ class Main(Star):
                     player_uid = hashlib.md5(player_name.encode("utf-8")).hexdigest()
                 players.append({"name": player_name, "uid": player_uid})
 
+        # async_ping() 测量的是轻量协议往返，比 async_status() 更接近
+        # 游戏内显示的延迟（不包含服务端 JSON 序列化开销）
         latency = int(round(getattr(status, "latency", 0) or 0))
+        try:
+            ping_latency = await asyncio.wait_for(
+                server.async_ping(), timeout=min(5, self.status_timeout_seconds)
+            )
+            if ping_latency > 0:
+                latency = int(round(ping_latency))
+        except Exception:
+            pass  # ping 失败时回退到 status.latency
+
         version = (
             getattr(status.version, "name", "Unknown") if status.version else "Unknown"
         )
@@ -1928,28 +2054,17 @@ class Main(Star):
         return session_obj
 
     def _list_templates(self) -> list[str]:
-        """列出模板目录中的可用模板名（不带 .py）。"""
-        if not self._templates_dir.exists():
-            return []
-        names: list[str] = []
-        for path in self._templates_dir.glob("*.py"):
-            if path.name == "__init__.py":
-                continue
-            names.append(path.stem)
-        names.sort()
-        return names
+        """委托到 template_loader 模块。"""
+        return _tl_mod.list_templates(self._templates_dir)
 
     @staticmethod
     def _is_valid_template_name(name: str) -> bool:
-        """模板名合法性校验。
-
-        只允许 Python 标识符风格，避免路径穿越和非法导入。
-        """
-        return bool(name) and name.isidentifier()
+        """委托到 template_loader 模块。"""
+        return _tl_mod.is_valid_template_name(name)
 
     def _template_file_path(self, template_name: str) -> Path:
-        """根据模板名获取模板文件路径。"""
-        return self._templates_dir / f"{template_name}.py"
+        """委托到 template_loader 模块。"""
+        return _tl_mod.template_file_path(self._templates_dir, template_name)
 
     async def _get_template_renderer(
         self, template_name: str
@@ -2146,23 +2261,12 @@ class Main(Star):
             series[slot]["latency"] = latency
 
         return series
-
     @staticmethod
     def _find_server_addresses_by_name(
-        servers: dict[str, dict[str, Any]],
-        query_name: str,
+        servers: dict[str, dict[str, Any]], query_name: str
     ) -> list[str]:
-        """按显示名称匹配会话内已添加服务器，返回命中的地址列表。"""
-        target = query_name.strip()
-        if not target:
-            return []
-
-        addresses: list[str] = []
-        for address, server_obj in servers.items():
-            server_name = str(server_obj.get("name", "")).strip()
-            if server_name == target:
-                addresses.append(address)
-        return addresses
+        """按显示名称匹配会话内已添加服务器。"""
+        return _store_mod.find_server_addresses_by_name(servers, query_name)
 
     @staticmethod
     def _resolve_unique_server_name(
@@ -2171,71 +2275,31 @@ class Main(Star):
         *,
         exclude_address: str | None = None,
     ) -> tuple[str, bool]:
-        """会话内服务器名称去重，必要时自动追加序号后缀。"""
-        base = desired_name.strip()
-        if not base:
-            base = "未命名服务器"
-
-        existing_names: set[str] = set()
-        for address, server_obj in servers.items():
-            if exclude_address and address == exclude_address:
-                continue
-            existing_name = str(server_obj.get("name", "")).strip()
-            if existing_name:
-                existing_names.add(existing_name)
-
-        if base not in existing_names:
-            return base, False
-
-        index = 1
-        while True:
-            candidate = f"{base}({index})"
-            if candidate not in existing_names:
-                return candidate, True
-            index += 1
+        """会话内服务器名称去重。"""
+        return _store_mod.resolve_unique_server_name(
+            desired_name, servers, exclude_address=exclude_address
+        )
 
     def _normalize_address(self, address: str) -> str:
-        """标准化服务器地址。
-
-        - 当 `auto_append_default_port` 为 True 时：
-          - 缺省端口补 25565；
-          - 端口非数字时回退为默认端口。
-        - 当 `auto_append_default_port` 为 False 时，保持原样。
-        """
-        address = address.strip()
-        if not address:
-            return address
-        if not self.auto_append_default_port:
-            return address
-        if ":" not in address:
-            return f"{address}:{DEFAULT_PORT}"
-        host, port_str = address.rsplit(":", 1)
-        if not port_str.isdigit():
-            return f"{host}:{DEFAULT_PORT}"
-        return f"{host}:{int(port_str)}"
+        """标准化服务器地址。"""
+        return _store_mod.normalize_address(address, self.auto_append_default_port)
 
     @staticmethod
     def _address_hash(address: str) -> str:
-        """将地址映射为稳定哈希，用作缓存目录名。"""
-        return hashlib.sha1(address.encode("utf-8")).hexdigest()
+        """将地址映射为稳定哈希。"""
+        return _store_mod.address_hash(address)
 
     def _server_cache_dir(self, address: str) -> Path:
-        """服务器缓存目录。"""
-        return self._cache_root / self._address_hash(address)
+        return _cache_mod.server_cache_dir(self._cache_root, address)
 
     def _icon_cache_path(self, address: str) -> Path:
-        """服务器图标缓存路径。"""
-        return self._server_cache_dir(address) / "icon.png"
+        return _cache_mod.icon_cache_path(self._cache_root, address)
 
     def _skin_cache_path(self, address: str, uid: str) -> Path:
-        """玩家头像缓存路径。"""
-        return self._server_cache_dir(address) / "skins" / f"{uid}.png"
+        return _cache_mod.skin_cache_path(self._cache_root, address, uid)
 
     def _delete_server_cache(self, address: str) -> None:
-        """删除指定服务器的全部缓存目录。"""
-        cache_dir = self._server_cache_dir(address)
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir, ignore_errors=True)
+        _cache_mod.delete_server_cache(self._cache_root, address)
 
     @staticmethod
     def _should_ignore_self_event(event: AstrMessageEvent) -> bool:
@@ -2280,6 +2344,7 @@ class Main(Star):
             "#重命名 <旧名称> <新名称>\n"
             "#服务器列表\n"
             "#列表\n"
+            "#重定向 <服务器名称> <新地址>\n"
             "#模板 [模板名|reload]\n"
             "#帮助 / #help"
         )
@@ -2296,15 +2361,8 @@ class Main(Star):
         return not port_str.isdigit()
 
     def _build_history_title(self) -> str:
-        """构建历史图标题文本（随配置动态变化）。"""
-        points = max(int(self.history_limit), 1)
-        interval = max(int(self.silent_query_interval_seconds), 1)
-        total_seconds = points * interval
-        if total_seconds % 3600 == 0:
-            total_window = f"{total_seconds // 3600}h"
-        else:
-            total_window = f"{total_seconds // 60}m"
-        return f"历史延迟（{total_window} / {points}点）"
+        """委托到 query 模块。"""
+        return _query_mod.build_history_title(self.history_limit, self.silent_query_interval_seconds)
 
     async def _call_template_renderer(
         self,
@@ -2379,51 +2437,16 @@ class Main(Star):
             except Exception as exc:
                 logger.debug("cache cleanup failed: %s", exc)
             await asyncio.sleep(QUERY_CACHE_CLEANUP_INTERVAL_SECONDS)
-
     def _extract_motd_text(self, description: Any) -> str:
         """提取并归一化服务端 Motd。"""
-        if description is None:
-            return ""
-        try:
-            to_plain = getattr(description, "to_plain", None)
-            if callable(to_plain):
-                text = self._strip_minecraft_format_codes(str(to_plain() or "")).strip()
-                if text:
-                    return text
-        except Exception:
-            pass
+        return _query_mod.extract_motd_text(description)
 
-        text = self._strip_minecraft_format_codes(
-            self._flatten_motd_node(description)
-        ).strip()
-        return text[:300]
-
-    @staticmethod
     def _strip_minecraft_format_codes(text: str) -> str:
-        """移除 Minecraft Motd 文本中的格式控制码（§x）。"""
-        if not text:
-            return ""
-        cleaned = MOTD_FORMAT_CODE_PATTERN.sub("", text)
-        # 处理末尾孤立的 §
-        return cleaned.replace("§", "")
+        """委托到 query 模块。"""
+        return _query_mod.strip_minecraft_format_codes(text)
 
     def _flatten_motd_node(self, node: Any) -> str:
-        if node is None:
-            return ""
-        if isinstance(node, str):
-            return node
-        if isinstance(node, dict):
-            parts: list[str] = []
-            if "text" in node:
-                parts.append(self._flatten_motd_node(node.get("text")))
-            if "extra" in node:
-                parts.append(self._flatten_motd_node(node.get("extra")))
-            if "translate" in node and not parts:
-                parts.append(self._flatten_motd_node(node.get("translate")))
-            return "".join(parts)
-        if isinstance(node, (list, tuple)):
-            return "".join(self._flatten_motd_node(item) for item in node)
-        return str(node)
+        return _query_mod.flatten_motd_node(node)
 
     async def _download_and_render_avatar_by_uuid(
         self,
@@ -2552,74 +2575,13 @@ class Main(Star):
             logger.debug("render avatar from skin failed: %s", exc)
             return False
 
-    def _render_avatar_by_pilskinmc_object_api(
-        self,
-        skin_bytes: bytes,
-    ) -> Image.Image | None:
-        """尝试使用 PILSkinMC 的对象式 API 生成头像。
-
-        兼容性说明：
-        - 不同版本 PILSkinMC 的入口类/方法可能不同；
-        - 这里仅在检测到可用 API 时调用，否则返回 None。
-        """
-        if _PILSKINMC is None:
-            return None
-
-        skin_cls = getattr(_PILSKINMC, "Skin", None)
-        if skin_cls is None:
-            return None
-
-        try:
-            if hasattr(skin_cls, "open") and callable(skin_cls.open):
-                skin_obj = skin_cls.open(io.BytesIO(skin_bytes))
-            else:
-                skin_obj = skin_cls(io.BytesIO(skin_bytes))
-        except Exception:
-            return None
-
-        # 方法式 API
-        for method_name in (
-            "get_avatar",
-            "render_avatar",
-            "render_head",
-            "get_head",
-        ):
-            method = getattr(skin_obj, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                sig = inspect.signature(method)
-                if "size" in sig.parameters:
-                    rendered = method(size=SKIN_SIZE)
-                else:
-                    rendered = method()
-                if isinstance(rendered, Image.Image):
-                    return rendered.convert("RGBA")
-            except Exception:
-                continue
-
-        # 属性式 API（少数实现）
-        for attr_name in ("avatar", "head"):
-            value = getattr(skin_obj, attr_name, None)
-            if isinstance(value, Image.Image):
-                return value.convert("RGBA")
-
-        return None
+    def _render_avatar_by_pilskinmc_object_api(self, skin_bytes: bytes) -> Image.Image | None:
+        """委托到 avatar 模块。"""
+        return _avatar_mod._render_avatar_by_pilskinmc_object_api(skin_bytes)
 
     def _render_avatar_head_fallback(self, skin: Image.Image) -> Image.Image:
-        """标准皮肤头像回退渲染（前脸 + 帽子层）。"""
-        work_skin = skin
-        if _PILSKINMC is not None and hasattr(_PILSKINMC, "fix_legacy"):
-            with contextlib.suppress(Exception):
-                if work_skin.height == 32:
-                    work_skin = _PILSKINMC.fix_legacy(work_skin)
-
-        head = work_skin.crop((8, 8, 16, 16)).convert("RGBA")
-        # 叠加帽子层
-        if work_skin.width >= 48 and work_skin.height >= 16:
-            overlay = work_skin.crop((40, 8, 48, 16)).convert("RGBA")
-            head.alpha_composite(overlay)
-        return head
+        """委托到 avatar 模块。"""
+        return _avatar_mod._render_avatar_head_fallback(skin)
 
     @staticmethod
     def _build_uuid_candidates(uid: str) -> list[str]:
