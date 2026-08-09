@@ -4,7 +4,9 @@
 """
 import asyncio  # noqa: F401  (确保 asyncio 在 mock 注入前可用)
 import copy
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -12,6 +14,9 @@ from types import SimpleNamespace
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 PARENT_DIR = PLUGIN_DIR.parent
+
+# 测试专用临时根目录,asyncTearDown 统一清理,避免在用户机器上残留缓存
+_TEMP_ROOT = tempfile.mkdtemp(prefix="astrbot_plugin_test_")
 
 
 def _make_module(name, **attrs):
@@ -44,7 +49,7 @@ _make_module("astrbot.core")
 _make_module("astrbot.core.utils")
 _make_module(
     "astrbot.core.utils.astrbot_path",
-    get_astrbot_temp_path=lambda: r"C:\Users\TW2NTY_NIN9\AppData\Local\Temp\astrbot_test",
+    get_astrbot_temp_path=lambda: _TEMP_ROOT,
 )
 
 
@@ -139,6 +144,9 @@ class BugFixTests(unittest.IsolatedAsyncioTestCase):
         )
         self.plugin._load_runtime_config()  # 模拟 initialize 阶段的配置加载
         self.assertIs(self.plugin.auto_append_default_port, True)
+
+    async def asyncTearDown(self):
+        shutil.rmtree(_TEMP_ROOT, ignore_errors=True)
 
     def seed(self, servers: dict):
         KV.data = {"sessions": {"sess-1": {"template": "default_method", "servers": servers}}}
