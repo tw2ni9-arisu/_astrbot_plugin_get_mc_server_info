@@ -2042,8 +2042,9 @@ class Main(Star):
             ):
                 icon_file.unlink(missing_ok=True)
 
-        # 直连查询（#查询 <地址>）产生的缓存目录不在存储中，按目录最后修改时间清理：
-        # 超过 TTL 未再写入则整体删除；否则仅清理内部过期文件。
+        # 直连查询（#查询 <地址>）产生的缓存目录不在存储中，按目录内最新文件
+        # 修改时间清理：全部文件超过 TTL 未更新则整体删除；否则仅清理内部过期文件。
+        # 注意不能用目录 mtime——覆盖已有文件（如 icon.png、skins/*.png）不会刷新它。
         if not self._cache_root.is_dir():
             return
         managed_dirs = {
@@ -2053,10 +2054,14 @@ class Main(Star):
             if not cache_dir.is_dir() or cache_dir in managed_dirs:
                 continue
             try:
-                dir_mtime = int(cache_dir.stat().st_mtime)
+                latest_mtime = 0
+                for file_path in cache_dir.rglob("*"):
+                    if file_path.is_file():
+                        latest_mtime = max(latest_mtime, int(file_path.stat().st_mtime))
             except OSError:
                 continue
-            if now - dir_mtime > self.cache_ttl_seconds:
+            # 空目录或全部文件过期：整体回收
+            if latest_mtime == 0 or now - latest_mtime > self.cache_ttl_seconds:
                 shutil.rmtree(cache_dir, ignore_errors=True)
                 continue
             for skin_file in cache_dir.joinpath("skins").glob("*.png"):

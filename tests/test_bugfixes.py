@@ -282,6 +282,34 @@ class BugFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(new_skin.exists(), "未过期目录内的过期皮肤文件应删除")
         self.assertTrue(new_icon.exists(), "未过期目录内的新图标应保留")
 
+    async def test_cleanup_orphan_dir_with_fresh_files(self):
+        """目录 mtime 旧但内部文件新(覆盖写入不刷新目录 mtime)时不应整体删除。"""
+        import os
+        import time as time_mod
+
+        from astrbot_plugin_get_mc_server_info.cache import server_cache_dir
+
+        self.seed({})
+        root = self.plugin._cache_root
+        cache_dir = server_cache_dir(root, "busy.example.com")
+        icon = cache_dir / "icon.png"
+        icon.parent.mkdir(parents=True, exist_ok=True)
+        icon.write_bytes(b"png")  # 最新写入,文件 mtime = now
+        old_skin = cache_dir / "skins" / "old.png"
+        old_skin.parent.mkdir(parents=True, exist_ok=True)
+        old_skin.write_bytes(b"png")
+
+        # 把目录 mtime 拨回 2 倍 TTL 之前,模拟“文件被反复覆盖、目录 mtime 停滞”
+        past = time_mod.time() - self.plugin.cache_ttl_seconds * 2
+        os.utime(cache_dir, (past, past))
+        os.utime(old_skin, (past, past))  # 旧皮肤文件单独过期
+
+        await self.plugin._cleanup_expired_cache()
+
+        self.assertTrue(cache_dir.exists(), "内部有新文件的目录不应被整体删除")
+        self.assertTrue(icon.exists(), "新图标不应被删除")
+        self.assertFalse(old_skin.exists(), "保留目录内过期的旧皮肤仍应被清理")
+
     async def test_cleanup_managed_dir_untouched(self):
         """受管(已保存)服务器的缓存目录不应被孤儿逻辑删除。"""
         import os
