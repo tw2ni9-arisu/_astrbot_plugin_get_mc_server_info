@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Reasonix 本地工具
+.reasonix/
+reasonix.toml
+
+# 模板背景图(体积大,不入库;缺失时模板自动回退纯色背景)
+templates/default_method.png

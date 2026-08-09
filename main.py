@@ -451,6 +451,11 @@ class Main(Star):
                 f"删除失败！当前会话内不存在名为 [{target_name}] 的服务器"
             )
             return
+        if result.get("error") == "AMBIGUOUS_SERVER_NAME":
+            yield event.plain_result(
+                f"删除失败！检测到多个同名服务器 [{target_name}]，请使用服务器地址删除"
+            )
+            return
         if result.get("error") == "SAVE_FAILED":
             yield event.plain_result("删除失败！服务器保存失败，请稍后重试")
             return
@@ -540,6 +545,14 @@ class Main(Star):
         result = await self._redirect_server_data(event.unified_msg_origin, server_name, new_raw_address)
         if result.get("error") == "SERVER_NOT_FOUND":
             yield event.plain_result(f'重定向失败！服务器 "{server_name}" 不存在')
+            return
+        if result.get("error") == "AMBIGUOUS_SERVER_NAME":
+            yield event.plain_result(
+                f'重定向失败！检测到多个同名服务器 "{server_name}"，请先处理重名后再重试'
+            )
+            return
+        if result.get("error") == "CONNECTION_TIMEOUT":
+            yield event.plain_result("重定向失败！新地址连接超时")
             return
         if result.get("error") == "CONNECTION_FAILED":
             yield event.plain_result("重定向失败！新地址无法连接")
@@ -1160,8 +1173,11 @@ class Main(Star):
             session_obj = self._get_or_create_session(store, session_key)
             servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
             addresses = self._find_server_addresses_by_name(servers, target)
-            if not addresses and target in servers:
-                addresses = [target]
+            if not addresses:
+                # 名称未命中时按规范化地址匹配（补全默认端口后与存储键对齐）
+                normalized_target = self._normalize_address(target)
+                if normalized_target in servers:
+                    addresses = [normalized_target]
             if not addresses:
                 if idempotent:
                     return {
@@ -1177,6 +1193,13 @@ class Main(Star):
                     "server": target,
                     "error": "SERVER_NOT_FOUND",
                     "message": "saved server not found in current session",
+                }
+            if len(addresses) > 1:
+                return {
+                    "ok": False,
+                    "server": target,
+                    "error": "AMBIGUOUS_SERVER_NAME",
+                    "message": "multiple saved servers use this name",
                 }
 
             removed: list[dict[str, Any]] = []
@@ -1231,8 +1254,11 @@ class Main(Star):
             session_obj = self._get_or_create_session(store, session_key)
             servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
             addresses = self._find_server_addresses_by_name(servers, old_name)
-            if not addresses and old_name in servers:
-                addresses = [old_name]
+            if not addresses:
+                # 名称未命中时按规范化地址匹配（补全默认端口后与存储键对齐）
+                normalized_old = self._normalize_address(old_name)
+                if normalized_old in servers:
+                    addresses = [normalized_old]
             if not addresses:
                 return {
                     "ok": False,
@@ -1311,6 +1337,10 @@ class Main(Star):
                 return {"ok": False, "server_name": server_name,
                         "error": "SERVER_NOT_FOUND",
                         "message": f"server '{server_name}' not found"}
+            if len(matched) > 1:
+                return {"ok": False, "server_name": server_name,
+                        "error": "AMBIGUOUS_SERVER_NAME",
+                        "message": f"multiple saved servers use name '{server_name}'"}
             old_address = matched[0]
             old_server = dict(servers[old_address])  # 浅拷贝，避免持锁操作
 
@@ -1319,7 +1349,7 @@ class Main(Star):
             status = await self._fetch_server_status(new_address, need_players=False)
         except McServerTimeoutError:
             return {"ok": False, "server_name": server_name,
-                    "error": "CONNECTION_FAILED",
+                    "error": "CONNECTION_TIMEOUT",
                     "message": "new address connection timed out"}
         except McServerConnectionError:
             return {"ok": False, "server_name": server_name,
@@ -2005,6 +2035,33 @@ class Main(Star):
                 if now - int(skin_file.stat().st_mtime) > self.cache_ttl_seconds:
                     skin_file.unlink(missing_ok=True)
 
+            icon_file = cache_dir.joinpath("icon.png")
+            if (
+                icon_file.exists()
+                and now - int(icon_file.stat().st_mtime) > self.cache_ttl_seconds
+            ):
+                icon_file.unlink(missing_ok=True)
+
+        # 直连查询（#查询 <地址>）产生的缓存目录不在存储中，按目录最后修改时间清理：
+        # 超过 TTL 未再写入则整体删除；否则仅清理内部过期文件。
+        if not self._cache_root.is_dir():
+            return
+        managed_dirs = {
+            self._server_cache_dir(address) for address in session_server_map
+        }
+        for cache_dir in self._cache_root.iterdir():
+            if not cache_dir.is_dir() or cache_dir in managed_dirs:
+                continue
+            try:
+                dir_mtime = int(cache_dir.stat().st_mtime)
+            except OSError:
+                continue
+            if now - dir_mtime > self.cache_ttl_seconds:
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                continue
+            for skin_file in cache_dir.joinpath("skins").glob("*.png"):
+                if now - int(skin_file.stat().st_mtime) > self.cache_ttl_seconds:
+                    skin_file.unlink(missing_ok=True)
             icon_file = cache_dir.joinpath("icon.png")
             if (
                 icon_file.exists()
