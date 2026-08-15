@@ -145,6 +145,19 @@ class BugFixTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._load_runtime_config()  # 模拟 initialize 阶段的配置加载
         self.assertIs(self.plugin.auto_append_default_port, True)
 
+    def test_command_prefix_is_slash(self):
+        """传统命令应使用 / 前缀,旧的 # 前缀不再匹配。"""
+        self.assertIsNotNone(
+            plugin_main.ADD_SERVER_PATTERN.fullmatch("/添加 name aaa.bbb.ccc")
+        )
+        self.assertIsNone(
+            plugin_main.ADD_SERVER_PATTERN.fullmatch("#添加 name aaa.bbb.ccc")
+        )
+        self.assertIsNotNone(plugin_main.HELP_PATTERN.fullmatch("/help"))
+        self.assertIsNone(plugin_main.HELP_PATTERN.fullmatch("#help"))
+        self.assertIn("/添加", plugin_main.Main._build_help_message())
+        self.assertNotIn("#添加", plugin_main.Main._build_help_message())
+
     async def asyncTearDown(self):
         shutil.rmtree(_TEMP_ROOT, ignore_errors=True)
 

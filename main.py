@@ -56,16 +56,16 @@ try:
 except Exception:
     _PILSKINMC = None
 
-ADD_SERVER_PATTERN = re.compile(r"^#(?:添加服务器|添加)\s+(\S+)\s+(\S+)\s*$")
-QUERY_SERVER_PATTERN = re.compile(r"^#(?:查询服务器|查询)(?:\s+(\S+))?\s*$")
-DELETE_SERVER_PATTERN = re.compile(r"^#(?:删除服务器|删除)\s+(\S+)\s*$")
-RENAME_SERVER_PATTERN = re.compile(r"^#(?:重命名服务器|重命名)\s+(\S+)\s+(\S+)\s*$")
-LIST_SERVER_PATTERN = re.compile(r"^#(?:服务器列表|列表)\s*$")
-TEMPLATE_PATTERN = re.compile(r"^#模板(?:\s+(\S+))?\s*$")
-REDIRECT_SERVER_PATTERN = re.compile(r"^#重定向\s+(\S+)\s+(\S+)\s*$")
-HELP_PATTERN = re.compile(r"^#(?:帮助|help)\s*$")
+ADD_SERVER_PATTERN = re.compile(r"^/(?:添加服务器|添加)\s+(\S+)\s+(\S+)\s*$")
+QUERY_SERVER_PATTERN = re.compile(r"^/(?:查询服务器|查询)(?:\s+(\S+))?\s*$")
+DELETE_SERVER_PATTERN = re.compile(r"^/(?:删除服务器|删除)\s+(\S+)\s*$")
+RENAME_SERVER_PATTERN = re.compile(r"^/(?:重命名服务器|重命名)\s+(\S+)\s+(\S+)\s*$")
+LIST_SERVER_PATTERN = re.compile(r"^/(?:服务器列表|列表)\s*$")
+TEMPLATE_PATTERN = re.compile(r"^/模板(?:\s+(\S+))?\s*$")
+REDIRECT_SERVER_PATTERN = re.compile(r"^/重定向\s+(\S+)\s+(\S+)\s*$")
+HELP_PATTERN = re.compile(r"^/(?:帮助|help)\s*$")
 COMMAND_FALLBACK_PATTERN = re.compile(
-    r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+    r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
 )
 
 # 默认补全端口（Minecraft Java Edition 常见端口）
@@ -242,9 +242,9 @@ class Main(Star):
         self._avatar_file_locks.clear()
         logger.info("astrbot_plugin_get_mc_server_info terminated.")
 
-    @filter.regex(r"^#(?:添加服务器|添加)\s+\S+\s+\S+\s*$")
+    @filter.regex(r"^/(?:添加服务器|添加)\s+\S+\s+\S+\s*$")
     async def add_server(self, event: AstrMessageEvent):
-        """添加 MC 服务器：#添加服务器 <服务器名称> <服务器地址> / #添加 <服务器名称> <服务器地址>"""
+        """添加 MC 服务器：/添加服务器 <服务器名称> <服务器地址>；或 /添加 <服务器名称> <服务器地址>"""
         if self._should_ignore_self_event(event):
             return
 
@@ -289,9 +289,9 @@ class Main(Star):
             return
         yield event.plain_result(f"添加成功！服务器 [{final_name}] 已添加")
 
-    @filter.regex(r"^#(?:查询服务器|查询)(?:\s+\S+)?\s*$")
+    @filter.regex(r"^/(?:查询服务器|查询)(?:\s+\S+)?\s*$")
     async def query_server(self, event: AstrMessageEvent):
-        """查询 MC 服务器：#查询服务器 [服务器名称|服务器地址] / #查询 [服务器名称|服务器地址]"""
+        """查询 MC 服务器：/查询服务器 [服务器名称|服务器地址]；或 /查询 [服务器名称|服务器地址]"""
         if self._should_ignore_self_event(event):
             return
 
@@ -342,12 +342,12 @@ class Main(Star):
         final_message = "\n".join(messages_to_send)
         yield event.plain_result(final_message)
 
-    @filter.regex(r"^#模板(?:\s+\S+)?\s*$")
+    @filter.regex(r"^/模板(?:\s+\S+)?\s*$")
     async def switch_template(self, event: AstrMessageEvent):
         """模板切换命令。
 
-        - `#模板`：列出 templates 目录下的全部模板名（不带 .py）。
-        - `#模板 <模板名>`：切换当前会话模板。
+        - `/模板`：列出 templates 目录下的全部模板名（不带 .py）。
+        - `/模板 <模板名>`：切换当前会话模板。
         """
         if self._should_ignore_self_event(event):
             return
@@ -366,7 +366,7 @@ class Main(Star):
             yield event.plain_result(output)
             return
 
-        # 手动清理模板缓存：#模板 reload
+        # 手动清理模板缓存：/模板 reload
         if template_name == "reload":
             await self._switch_template_data(event.unified_msg_origin, template_name)
             yield event.plain_result("模板缓存已重载")
@@ -384,9 +384,9 @@ class Main(Star):
 
         yield event.plain_result(f"已切换至 {template_name}")
 
-    @filter.regex(r"^#(?:重命名服务器|重命名)\s+\S+\s+\S+\s*$")
+    @filter.regex(r"^/(?:重命名服务器|重命名)\s+\S+\s+\S+\s*$")
     async def rename_server(self, event: AstrMessageEvent):
-        """重命名当前会话中的服务器：#重命名服务器 <旧名称> <新名称> / #重命名 <旧名称> <新名称>"""
+        """重命名当前会话中的服务器：/重命名服务器 <旧名称> <新名称>；或 /重命名 <旧名称> <新名称>"""
         if self._should_ignore_self_event(event):
             return
 
@@ -433,9 +433,9 @@ class Main(Star):
             f"重命名成功！服务器 [{previous_name}] 已重命名为 [{final_name}]"
         )
 
-    @filter.regex(r"^#(?:删除服务器|删除)\s+\S+\s*$")
+    @filter.regex(r"^/(?:删除服务器|删除)\s+\S+\s*$")
     async def delete_server(self, event: AstrMessageEvent):
-        """删除当前会话中的服务器：#删除服务器 <服务器名称> / #删除 <服务器名称>"""
+        """删除当前会话中的服务器：/删除服务器 <服务器名称>；或 /删除 <服务器名称>"""
         if self._should_ignore_self_event(event):
             return
 
@@ -469,9 +469,9 @@ class Main(Star):
             f"删除成功！已删除服务器 [{target_name}] 共 {result.get('removed_count', 0)} 个，并清理对应缓存"
         )
 
-    @filter.regex(r"^#(?:服务器列表|列表)\s*$")
+    @filter.regex(r"^/(?:服务器列表|列表)\s*$")
     async def list_servers(self, event: AstrMessageEvent):
-        """列出当前会话内服务器：#服务器列表 / #列表"""
+        """列出当前会话内服务器：/服务器列表；或 /列表"""
         if self._should_ignore_self_event(event):
             return
 
@@ -500,7 +500,7 @@ class Main(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.regex(
-        r"^#(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+        r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
     )
     async def command_help_and_format_guard(self, event: AstrMessageEvent):
         """命令帮助与格式兜底。"""
@@ -531,9 +531,9 @@ class Main(Star):
 
         yield event.plain_result(self._build_help_message())
 
-    @filter.regex(r"^#重定向\s+\S+\s+\S+\s*$")
+    @filter.regex(r"^/重定向\s+\S+\s+\S+\s*$")
     async def redirect_server(self, event: AstrMessageEvent):
-        """重定向 MC 服务器地址：#重定向 <服务器名称> <新地址>"""
+        """重定向 MC 服务器地址：/重定向 <服务器名称> <新地址>"""
         if self._should_ignore_self_event(event):
             return
         matched = REDIRECT_SERVER_PATTERN.match(event.message_str.strip())
@@ -2042,7 +2042,7 @@ class Main(Star):
             ):
                 icon_file.unlink(missing_ok=True)
 
-        # 直连查询（#查询 <地址>）产生的缓存目录不在存储中，按目录内最新文件
+        # 直连查询（/查询 <地址>）产生的缓存目录不在存储中，按目录内最新文件
         # 修改时间清理：全部文件超过 TTL 未更新则整体删除；否则仅清理内部过期文件。
         # 注意不能用目录 mtime——覆盖已有文件（如 icon.png、skins/*.png）不会刷新它。
         if not self._cache_root.is_dir():
@@ -2396,19 +2396,19 @@ class Main(Star):
         """构建命令帮助文案。"""
         return (
             "命令用法：\n"
-            "#添加服务器 <服务器名称> <服务器地址>\n"
-            "#添加 <服务器名称> <服务器地址>\n"
-            "#查询服务器 [服务器名称|服务器地址]\n"
-            "#查询 [服务器名称|服务器地址]\n"
-            "#删除服务器 <服务器名称>\n"
-            "#删除 <服务器名称>\n"
-            "#重命名服务器 <旧名称> <新名称>\n"
-            "#重命名 <旧名称> <新名称>\n"
-            "#服务器列表\n"
-            "#列表\n"
-            "#重定向 <服务器名称> <新地址>\n"
-            "#模板 [模板名|reload]\n"
-            "#帮助 / #help"
+            "/添加服务器 <服务器名称> <服务器地址>\n"
+            "/添加 <服务器名称> <服务器地址>\n"
+            "/查询服务器 [服务器名称|服务器地址]\n"
+            "/查询 [服务器名称|服务器地址]\n"
+            "/删除服务器 <服务器名称>\n"
+            "/删除 <服务器名称>\n"
+            "/重命名服务器 <旧名称> <新名称>\n"
+            "/重命名 <旧名称> <新名称>\n"
+            "/服务器列表\n"
+            "/列表\n"
+            "/重定向 <服务器名称> <新地址>\n"
+            "/模板 [模板名|reload]\n"
+            "/帮助 或 /help"
         )
 
     @staticmethod
