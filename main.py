@@ -1703,7 +1703,11 @@ class Main(Star):
             players_max=status.players_max,
             server_version=status.version,
             motd=status.motd,
-            history=self._build_render_history([], now_ts=now),
+            # 直连查询不写入持久化历史，但当前查询结果仍需显示在图表最新点。
+            history=self._build_render_history(
+                [{"timestamp": now, "latency": status.latency}],
+                now_ts=now,
+            ),
             history_title=self._build_history_title(),
             icon_path=str(icon_path) if icon_path.exists() else None,
             players=players_for_render,
@@ -2289,7 +2293,7 @@ class Main(Star):
         *,
         now_ts: int | None = None,
     ) -> list[dict[str, int]]:
-        """构建用于渲染的固定长度历史序列，缺失点补零。"""
+        """按历史点顺序右对齐构建固定长度序列，缺失点补零。"""
         limit = max(int(self.history_limit), 1)
         interval = max(int(self.silent_query_interval_seconds), 1)
         end_ts = int(now_ts if now_ts is not None else time.time())
@@ -2299,26 +2303,23 @@ class Main(Star):
             {"timestamp": start_ts + index * interval, "latency": 0}
             for index in range(limit)
         ]
-        latest_by_slot: dict[int, tuple[int, int]] = {}
-
+        normalized_points: list[tuple[int, int]] = []
         for point in history_points:
             try:
                 ts = int(point.get("timestamp", 0) or 0)
                 latency = int(point.get("latency", 0) or 0)
             except Exception:
                 continue
-
-            if ts < start_ts or ts > end_ts + interval:
+            if ts <= 0 or ts > end_ts + interval:
                 continue
 
-            # 用“最接近槽位”策略映射时间点，避免采样抖动导致的错槽。
-            slot = int((ts - start_ts + interval // 2) // interval)
-            slot = max(0, min(slot, limit - 1))
-            previous = latest_by_slot.get(slot)
-            if previous is None or ts >= previous[0]:
-                latest_by_slot[slot] = (ts, max(latency, 0))
+            normalized_points.append((ts, max(latency, 0)))
 
-        for slot, (ts, latency) in latest_by_slot.items():
+        normalized_points.sort(key=lambda item: item[0])
+        normalized_points = normalized_points[-limit:]
+        first_slot = limit - len(normalized_points)
+        for index, (ts, latency) in enumerate(normalized_points):
+            slot = first_slot + index
             series[slot]["timestamp"] = ts
             series[slot]["latency"] = latency
 

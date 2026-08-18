@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,11 @@ WIDTH = 900
 PADDING = 24
 HEADER_H = 120
 MOTD_H = 72
-CHART_H = 220
+CHART_H = 232
 PLAYER_ROW_H = 38
 PLAYER_AVATAR_SIZE = 28
+CHART_GRID_COUNT = 5
+HOUR_SECONDS = 60 * 60
 
 # 主题色
 BG = (18, 22, 28)
@@ -98,6 +101,73 @@ def _load_template_background(width: int, height: int) -> Image.Image | None:
     return None
 
 
+def _next_twenty(value: int) -> int:
+    """返回严格大于 value 的最小 20 的倍数。"""
+    return max(20, (value // 20 + 1) * 20)
+
+
+def _calculate_y_axis_max(latencies: list[int]) -> int:
+    """按延迟平均值和尖峰计算纵轴上限。"""
+    if not latencies:
+        return 20
+
+    max_latency = max(latencies)
+    average_latency = sum(latencies) / len(latencies)
+    if max_latency <= average_latency + 20:
+        return _next_twenty(max_latency)
+
+    other_latencies = latencies.copy()
+    other_latencies.remove(max_latency)
+    if not other_latencies:
+        return _next_twenty(max_latency)
+    return _next_twenty(max(other_latencies))
+
+
+def _non_zero_latencies(latencies: list[int]) -> list[int]:
+    """返回用于最小值比较和纵轴计算的有效延迟。"""
+    return [latency for latency in latencies if latency > 0]
+
+
+def _floor_to_half_hour(timestamp: int) -> datetime:
+    """将时间向下取整到整点或半点。"""
+    current = datetime.fromtimestamp(timestamp)
+    return current.replace(
+        minute=0 if current.minute < 30 else 30,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _build_time_ticks(
+    history: list[dict[str, Any]],
+    plot_left: int,
+    plot_right: int,
+) -> list[tuple[int, str]]:
+    """生成从查询时间向左按小时排列的时间刻度。"""
+    timestamps: list[int] = []
+    for point in history:
+        try:
+            timestamp = int(point.get("timestamp", 0) or 0)
+        except Exception:
+            continue
+        if timestamp > 0:
+            timestamps.append(timestamp)
+    if not timestamps:
+        return []
+
+    latest_tick = int(_floor_to_half_hour(max(timestamps)).timestamp())
+    earliest_timestamp = min(timestamps)
+    tick_count = max(1, (latest_tick - earliest_timestamp) // HOUR_SECONDS + 1)
+    width = plot_right - plot_left
+    ticks: list[tuple[int, str]] = []
+    for index in range(tick_count):
+        timestamp = latest_tick - index * HOUR_SECONDS
+        x = int(plot_right - width * index / max(1, tick_count - 1))
+        label = datetime.fromtimestamp(timestamp).strftime("%H:%M")
+        ticks.append((x, label))
+    return ticks
+
+
 def _draw_history_chart(
     draw: ImageDraw.ImageDraw,
     chart_rect: tuple[int, int, int, int],
@@ -110,12 +180,38 @@ def _draw_history_chart(
     text_font = _load_font(16)
     draw.text((left + 16, top + 10), history_title, fill=TEXT, font=title_font)
 
-    plot_left, plot_right = left + 16, right - 16
-    plot_top, plot_bottom = top + 52, bottom - 20
+    plot_left, plot_right = left + 64, right - 16
+    plot_top, plot_bottom = top + 52, bottom - 48
 
-    for i in range(5):
-        y = int(plot_top + (plot_bottom - plot_top) * i / 4)
+    latencies = [max(0, int(point.get("latency", 0))) for point in history]
+    observed_latencies = _non_zero_latencies(latencies)
+    y_axis_max = _calculate_y_axis_max(observed_latencies or latencies)
+
+    for index in range(CHART_GRID_COUNT):
+        ratio = index / (CHART_GRID_COUNT - 1)
+        y = int(plot_top + (plot_bottom - plot_top) * ratio)
+        value = int(y_axis_max * (1 - ratio))
         draw.line((plot_left, y, plot_right, y), fill=GRID, width=1)
+        draw.line((plot_left - 4, y, plot_left, y), fill=GRID, width=1)
+        draw.text(
+            (plot_left - 8, y),
+            str(value),
+            fill=SUB_TEXT,
+            font=text_font,
+            anchor="rm",
+        )
+
+    for index, (x, label) in enumerate(
+        _build_time_ticks(history, plot_left, plot_right)
+    ):
+        draw.line((x, plot_bottom, x, plot_bottom + 4), fill=GRID, width=1)
+        draw.text(
+            (x, plot_bottom + 4 + (index % 2) * 18),
+            label,
+            fill=SUB_TEXT,
+            font=text_font,
+            anchor="mt",
+        )
 
     if not history:
         draw.text(
@@ -126,16 +222,14 @@ def _draw_history_chart(
         )
         return
 
-    latencies = [max(0, int(point.get("latency", 0))) for point in history]
-    lmin, lmax = min(latencies), max(latencies)
-    if lmax == lmin:
-        lmax = lmin + 1
+    lmin = min(observed_latencies) if observed_latencies else 0
+    lmax = max(latencies)
 
     points = []
     n = len(latencies)
     for idx, val in enumerate(latencies):
         x = int(plot_left + (plot_right - plot_left) * idx / max(1, n - 1))
-        ratio = (val - lmin) / (lmax - lmin)
+        ratio = min(1, max(0, val / y_axis_max))
         y = int(plot_bottom - ratio * (plot_bottom - plot_top))
         points.append((x, y))
 
@@ -209,7 +303,7 @@ async def render_server_report_image(
 ) -> str:
     # 1. 动态计算高度
     player_section_h = max(160, 56 + len(players) * PLAYER_ROW_H + 20)
-    # 修复：PADDING * 4，确保底部有足够的留白空间
+    # 保留底部留白，并为图表的新增坐标刻度预留高度
     total_h = PADDING * 5 + HEADER_H + MOTD_H + CHART_H + player_section_h
 
     # 2. 准备底图

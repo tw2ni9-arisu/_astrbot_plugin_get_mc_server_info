@@ -166,7 +166,7 @@ def build_render_history(
     history_limit: int,
     silent_query_interval_seconds: int,
 ) -> list[dict[str, int]]:
-    """构建用于渲染的固定长度历史序列，缺失点补零。"""
+    """按历史点顺序右对齐构建固定长度序列，缺失点补零。"""
     limit = max(int(history_limit), 1)
     interval = max(int(silent_query_interval_seconds), 1)
     end_ts = int(now_ts if now_ts is not None else time.time())
@@ -176,23 +176,23 @@ def build_render_history(
         {"timestamp": start_ts + index * interval, "latency": 0}
         for index in range(limit)
     ]
-    latest_by_slot: dict[int, tuple[int, int]] = {}
-
+    normalized_points: list[tuple[int, int]] = []
     for point in history_points:
         try:
             ts = int(point.get("timestamp", 0) or 0)
             latency = int(point.get("latency", 0) or 0)
         except Exception:
             continue
-        if ts < start_ts or ts > end_ts + interval:
+        if ts <= 0 or ts > end_ts + interval:
             continue
-        slot = int((ts - start_ts + interval // 2) // interval)
-        slot = max(0, min(slot, limit - 1))
-        previous = latest_by_slot.get(slot)
-        if previous is None or ts >= previous[0]:
-            latest_by_slot[slot] = (ts, max(latency, 0))
 
-    for slot, (ts, latency) in latest_by_slot.items():
+        normalized_points.append((ts, max(latency, 0)))
+
+    normalized_points.sort(key=lambda item: item[0])
+    normalized_points = normalized_points[-limit:]
+    first_slot = limit - len(normalized_points)
+    for index, (ts, latency) in enumerate(normalized_points):
+        slot = first_slot + index
         series[slot]["timestamp"] = ts
         series[slot]["latency"] = latency
 
