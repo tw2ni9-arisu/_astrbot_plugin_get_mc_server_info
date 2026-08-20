@@ -11,6 +11,9 @@
 - 获取服务器在线状态、延迟、版本、MOTD、在线玩家
 - 下载玩家皮肤并渲染头像
 - 渲染查询图片，包含 MOTD、延迟历史曲线、玩家列表
+- 缓存近 24 小时延迟历史，可查询趋势、最高值和最低值
+- 历史图保留断连/离线区间
+- 服务器离线时沿用最近一次 MOTD，无记录时使用默认文案
 - 支持多模板和模板热重载
 - 提供 LLM Tool Calling 接口
 - 缓存 Tool 查询结果、渲染结果、图标和头像
@@ -97,7 +100,7 @@
 | Tool | 参数 | 功能 |
 |------|------|------|
 | query_mc_server | server | 查询服务器状态，server 可以是已保存名称或地址 |
-| query_history_status | server | 查询已保存服务器近 24 小时的缓存延迟、最大值、最小值及时间点 |
+| query_history_status | server | 查询已保存服务器近 24 小时的缓存延迟趋势、最大值和最小值 |
 | add_mc_server | name, address | 添加服务器 |
 | delete_mc_server | server | 删除服务器 |
 | rename_mc_server | old_name, new_name | 重命名服务器 |
