@@ -84,6 +84,8 @@ STATUS_TIMEOUT = 10
 SKIN_SIZE = 32
 # 默认渲染模板（对应 templates/default_method.py）
 DEFAULT_TEMPLATE_NAME = "default_method"
+# 离线服务器没有实时 Motd 时使用的默认文本
+DEFAULT_OFFLINE_MOTD = "邦邦咔邦"
 # 全服主动查询并发上限
 QUERY_ALL_CONCURRENCY = 5
 # 头像下载并发上限
@@ -602,6 +604,36 @@ class Main(Star):
         except Exception as exc:
             return self._tool_internal_error("query_mc_server", exc)
 
+    @filter.llm_tool(name="query_history_status")
+    async def query_history_status_tool(
+        self, event: AstrMessageEvent, server: str
+    ) -> dict[str, Any]:
+        """查询已保存 Minecraft 服务器近 24 小时的缓存延迟历史。
+
+        当用户询问某个服务器近 24 小时的延迟趋势、最高延迟、最低延迟
+        或历史延迟记录时调用。server 只能传当前会话中已保存的服务器名称。
+
+        Args:
+            server(string): 已保存的服务器名称，例如：生存服、测试服。
+
+        Examples:
+            生存服
+            测试服
+
+        不要用于查询服务器当前是否在线或当前延迟；当前状态请调用
+        query_mc_server。
+        """
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            result = await self._query_history_status_data(
+                event.unified_msg_origin, server
+            )
+            return self._with_tool_meta(result)
+        except Exception as exc:
+            return self._tool_internal_error("query_history_status", exc)
+
     @filter.llm_tool(name="add_mc_server")
     async def add_mc_server_tool(
         self, event: AstrMessageEvent, name: str, address: str
@@ -1043,6 +1075,7 @@ class Main(Star):
                     }
                 real_server_obj["last_latency"] = status.latency
                 real_server_obj["last_active_query_at"] = now
+                real_server_obj["motd"] = str(status.motd or "")
                 self._append_latency(real_server_obj, status.latency, now)
                 await self._save_store(store)
             self._clear_tool_list_cache(session_key)
@@ -1054,6 +1087,67 @@ class Main(Star):
             address=address,
             managed=managed,
         )
+
+    async def _query_history_status_data(
+        self, session_key: str, server: str
+    ) -> dict[str, Any]:
+        """读取当前会话中指定服务器近 24 小时的缓存延迟历史。"""
+        query_name = (server or "").strip()
+        if not query_name:
+            return {
+                "ok": False,
+                "error": "INVALID_ARGUMENT",
+                "message": "请提供服务器名称",
+            }
+
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = dict(
+                session_obj.get("servers", {})
+            )
+            matched_addresses = self._find_server_addresses_by_name(
+                servers, query_name
+            )
+            if not matched_addresses:
+                return {
+                    "ok": False,
+                    "server": query_name,
+                    "error": "SERVER_NOT_FOUND",
+                    "message": f"未匹配到服务器名称“{query_name}”",
+                }
+            if len(matched_addresses) > 1:
+                return {
+                    "ok": False,
+                    "server": query_name,
+                    "error": "AMBIGUOUS_SERVER_NAME",
+                    "message": f"匹配到多个同名服务器“{query_name}”",
+                }
+
+            address = matched_addresses[0]
+            server_obj = servers.get(address, {})
+            history_points = server_obj.get("latency_history", [])
+            if not isinstance(history_points, list):
+                history_points = []
+
+        history_status = _query_mod.build_history_status(history_points)
+        message = (
+            f"服务器“{query_name}”近24小时暂无缓存延迟记录"
+            if not history_status["history"]
+            else (
+                f"服务器“{query_name}”近24小时暂无有效延迟记录"
+                if history_status["max_latency"] is None
+                else f"已返回服务器“{query_name}”近24小时缓存延迟记录"
+            )
+        )
+        return {
+            "ok": True,
+            "server": query_name,
+            "address": address,
+            "window": "24h",
+            "message": message,
+            **history_status,
+        }
 
     async def _add_server_data(
         self, session_key: str, name: str, raw_address: str
@@ -1121,6 +1215,7 @@ class Main(Star):
                 "address": address,
                 "latency_history": [],
                 "last_latency": status.latency,
+                "motd": str(status.motd or ""),
                 "last_silent_query_at": 0,
                 "last_active_query_at": 0,
                 "created_at": now,
@@ -1378,6 +1473,7 @@ class Main(Star):
             del servers[old_address]
             servers[new_address] = old_server
             servers[new_address]["address"] = new_address
+            servers[new_address]["motd"] = str(status.motd or "")
             try:
                 await self._save_store(store)
             except Exception as exc:
@@ -1592,6 +1688,55 @@ class Main(Star):
         if not server_obj:
             return event.plain_result("查询失败！群聊内无该服务器")
 
+        # 1) 拉取服务端状态（含玩家 sample）
+        try:
+            status = await self._fetch_server_status(address, need_players=True)
+        except Exception:
+            self._clear_query_render_cache(session_key, address)
+            history = server_obj.get("latency_history", [])
+            if not isinstance(history, list):
+                history = []
+            cached_motd = str(server_obj.get("motd", "") or "").strip()
+            if not cached_motd:
+                cached_motd = DEFAULT_OFFLINE_MOTD
+            now = int(time.time())
+            icon_path = self._icon_cache_path(address)
+            renderer = await self._get_template_renderer(template_name)
+            image_b64 = await self._call_template_renderer(
+                renderer,
+                server_name=str(server_obj.get("name", address)),
+                server_address=address,
+                latency="Offline",
+                offline=True,
+                players_online=0,
+                players_max=0,
+                server_version="Unknown",
+                motd=cached_motd,
+                history=self._build_render_history(
+                    [*history, {"timestamp": now, "latency": 0}],
+                    now_ts=now,
+                ),
+                history_title=self._build_history_title(),
+                icon_path=str(icon_path) if icon_path.exists() else None,
+                players=[],
+            )
+            return event.make_result().base64_image(image_b64)
+
+        # 2) 写回最新延迟、历史与 Motd
+        now = int(time.time())
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            real_server_obj = session_obj["servers"].get(address)
+            if not real_server_obj:
+                return event.plain_result("查询失败！群聊内无该服务器")
+            real_server_obj["last_latency"] = status.latency
+            real_server_obj["last_active_query_at"] = now
+            real_server_obj["motd"] = str(status.motd or "")
+            self._append_latency(real_server_obj, status.latency, now)
+            history = list(real_server_obj["latency_history"])
+            await self._save_store(store)
+
         cache_key = self._build_query_cache_key(
             session_key=session_key,
             address=address,
@@ -1606,34 +1751,12 @@ class Main(Star):
                 .base64_image(cached_image)
             )
 
-        # 1) 拉取服务端状态（含玩家 sample）
-        try:
-            status = await self._fetch_server_status(address, need_players=True)
-        except Exception:
-            return event.plain_result(f"服务器 [{server_obj['name']}] 查询失败！")
-
-        # 2) 刷新图标与玩家头像缓存
-        now = int(time.time())
+        # 3) 刷新图标与玩家头像缓存，清理过期缓存并生成渲染图
         await self._cache_server_icon(address, status.icon_base64)
         players_for_render = await self._cache_and_collect_player_avatars(
             address,
             status.players,
         )
-
-        # 3) 写回最新延迟与历史
-        async with self._store_lock:
-            store = await self._load_store()
-            session_obj = self._get_or_create_session(store, session_key)
-            real_server_obj = session_obj["servers"].get(address)
-            if not real_server_obj:
-                return event.plain_result("查询失败！群聊内无该服务器")
-            real_server_obj["last_latency"] = status.latency
-            real_server_obj["last_active_query_at"] = now
-            self._append_latency(real_server_obj, status.latency, now)
-            history = list(real_server_obj["latency_history"])
-            await self._save_store(store)
-
-        # 4) 清理过期缓存并生成渲染图
         await self._cleanup_expired_cache()
         icon_path = self._icon_cache_path(address)
         render_history = self._build_render_history(history, now_ts=now)
@@ -1672,6 +1795,12 @@ class Main(Star):
             template_name=template_name,
             mode="direct",
         )
+        try:
+            status = await self._fetch_server_status(address, need_players=True)
+        except Exception:
+            self._clear_query_render_cache(session_key, address)
+            return event.plain_result(f"服务器 [{address}] 查询失败！")
+
         cached_image = self._try_get_query_render_cache(cache_key)
         if cached_image is not None:
             return (
@@ -1679,11 +1808,6 @@ class Main(Star):
                 .message(f"缓存结果（{self.query_result_cache_ttl_seconds}秒内）")
                 .base64_image(cached_image)
             )
-
-        try:
-            status = await self._fetch_server_status(address, need_players=True)
-        except Exception:
-            return event.plain_result(f"服务器 [{address}] 查询失败！")
 
         now = int(time.time())
         await self._cache_server_icon(address, status.icon_base64)
@@ -1784,6 +1908,7 @@ class Main(Star):
                         continue
                     real_server_obj["last_latency"] = status.latency
                     real_server_obj["last_active_query_at"] = now
+                    real_server_obj["motd"] = str(status.motd or "")
                     self._append_latency(real_server_obj, status.latency, now)
                 await self._save_store(store)
 
@@ -1845,6 +1970,7 @@ class Main(Star):
                         continue
                     server_obj["last_latency"] = status.latency
                     server_obj["last_silent_query_at"] = now
+                    server_obj["motd"] = str(status.motd or "")
                     self._append_latency(server_obj, status.latency, now)
                 await self._save_store(store)
 
@@ -2293,7 +2419,7 @@ class Main(Star):
         *,
         now_ts: int | None = None,
     ) -> list[dict[str, int]]:
-        """按历史点顺序右对齐构建固定长度序列，缺失点补零。"""
+        """按时间槽构建固定长度序列，缺失点补零并保留断连间隔。"""
         limit = max(int(self.history_limit), 1)
         interval = max(int(self.silent_query_interval_seconds), 1)
         end_ts = int(now_ts if now_ts is not None else time.time())
@@ -2310,18 +2436,24 @@ class Main(Star):
                 latency = int(point.get("latency", 0) or 0)
             except Exception:
                 continue
-            if ts <= 0 or ts > end_ts + interval:
+            if ts <= 0 or ts < start_ts - interval or ts > end_ts + interval:
                 continue
 
             normalized_points.append((ts, max(latency, 0)))
 
         normalized_points.sort(key=lambda item: item[0])
         normalized_points = normalized_points[-limit:]
-        first_slot = limit - len(normalized_points)
+        previous_slot = -1
+        point_count = len(normalized_points)
         for index, (ts, latency) in enumerate(normalized_points):
-            slot = first_slot + index
+            target_slot = int((ts - start_ts + interval // 2) // interval)
+            target_slot = max(0, min(target_slot, limit - 1))
+            min_slot = previous_slot + 1
+            max_slot = limit - (point_count - index)
+            slot = min(max(target_slot, min_slot), max_slot)
             series[slot]["timestamp"] = ts
             series[slot]["latency"] = latency
+            previous_slot = slot
 
         return series
     @staticmethod

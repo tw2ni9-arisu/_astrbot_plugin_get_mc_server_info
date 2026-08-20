@@ -20,6 +20,12 @@ PLAYER_ROW_H = 38
 PLAYER_AVATAR_SIZE = 28
 CHART_GRID_COUNT = 5
 HOUR_SECONDS = 60 * 60
+TIME_TICK_FONT_SIZE = 12
+OUTAGE_LINE = (166, 182, 200)  # #A6B6C8
+OUTAGE_FILL = (211, 219, 230)  # #D3DBE6
+OUTAGE_LINE_WIDTH = 2
+OUTAGE_DASH_LENGTH = 6
+OUTAGE_DASH_GAP = 4
 
 # 主题色
 BG = (18, 22, 28)
@@ -128,6 +134,88 @@ def _non_zero_latencies(latencies: list[int]) -> list[int]:
     return [latency for latency in latencies if latency > 0]
 
 
+def _find_zero_ranges(latencies: list[int]) -> list[tuple[int, int]]:
+    """查找连续的断连/缺失区间。"""
+    ranges: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, latency in enumerate(latencies):
+        if latency <= 0 and start is None:
+            start = index
+        elif latency > 0 and start is not None:
+            ranges.append((start, index - 1))
+            start = None
+    if start is not None:
+        ranges.append((start, len(latencies) - 1))
+    return ranges
+
+
+def _draw_dashed_vertical_line(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    top: int,
+    bottom: int,
+) -> None:
+    """绘制断连边界的竖向虚线。"""
+    step = OUTAGE_DASH_LENGTH + OUTAGE_DASH_GAP
+    for y in range(top, bottom + 1, step):
+        draw.line(
+            (x, y, x, min(y + OUTAGE_DASH_LENGTH - 1, bottom)),
+            fill=OUTAGE_LINE,
+            width=OUTAGE_LINE_WIDTH,
+        )
+
+
+def _draw_outage_background(
+    image: Image.Image | None,
+    latencies: list[int],
+    plot_left: int,
+    plot_top: int,
+    plot_right: int,
+    plot_bottom: int,
+) -> list[tuple[int, int, bool, bool]]:
+    """填充断连区间并返回其边界，供后续绘制虚线。"""
+    if image is None or not _non_zero_latencies(latencies):
+        return []
+
+    point_count = len(latencies)
+    point_width = plot_right - plot_left
+
+    def point_x(index: int) -> int:
+        return int(plot_left + point_width * index / max(1, point_count - 1))
+
+    boundaries: list[tuple[int, int, bool, bool]] = []
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    plot_height = max(1, plot_bottom - plot_top)
+
+    for start, end in _find_zero_ranges(latencies):
+        left_x = (
+            plot_left
+            if start == 0
+            else (point_x(start - 1) + point_x(start)) // 2
+        )
+        right_x = (
+            plot_right
+            if end == point_count - 1
+            else (point_x(end) + point_x(end + 1)) // 2
+        )
+        if right_x <= left_x:
+            continue
+
+        for y in range(plot_top, plot_bottom + 1):
+            alpha = int(255 * 0.5 * (plot_bottom - y) / plot_height)
+            overlay_draw.line(
+                (left_x, y, right_x, y),
+                fill=(*OUTAGE_FILL, alpha),
+                width=1,
+            )
+        boundaries.append((left_x, right_x, start > 0, end < point_count - 1))
+
+    if boundaries:
+        image.alpha_composite(overlay)
+    return boundaries
+
+
 def _floor_to_half_hour(timestamp: int) -> datetime:
     """将时间向下取整到整点或半点。"""
     current = datetime.fromtimestamp(timestamp)
@@ -173,11 +261,13 @@ def _draw_history_chart(
     chart_rect: tuple[int, int, int, int],
     history: list[dict[str, Any]],
     history_title: str,
+    image: Image.Image | None = None,
 ) -> None:
     left, top, right, bottom = chart_rect
     # 修复：不再此处绘制圆角矩形，已统一在主函数的 overlay 图层处理
     title_font = _load_font(24)
     text_font = _load_font(16)
+    time_font = _load_font(TIME_TICK_FONT_SIZE)
     draw.text((left + 16, top + 10), history_title, fill=TEXT, font=title_font)
 
     plot_left, plot_right = left + 64, right - 16
@@ -186,6 +276,15 @@ def _draw_history_chart(
     latencies = [max(0, int(point.get("latency", 0))) for point in history]
     observed_latencies = _non_zero_latencies(latencies)
     y_axis_max = _calculate_y_axis_max(observed_latencies or latencies)
+    image = image or getattr(draw, "_image", None)
+    outage_boundaries = _draw_outage_background(
+        image,
+        latencies,
+        plot_left,
+        plot_top,
+        plot_right,
+        plot_bottom,
+    )
 
     for index in range(CHART_GRID_COUNT):
         ratio = index / (CHART_GRID_COUNT - 1)
@@ -193,13 +292,14 @@ def _draw_history_chart(
         value = int(y_axis_max * (1 - ratio))
         draw.line((plot_left, y, plot_right, y), fill=GRID, width=1)
         draw.line((plot_left - 4, y, plot_left, y), fill=GRID, width=1)
-        draw.text(
-            (plot_left - 8, y),
-            str(value),
-            fill=SUB_TEXT,
-            font=text_font,
-            anchor="rm",
-        )
+        if value != 0:
+            draw.text(
+                (plot_left - 8, y),
+                str(value),
+                fill=SUB_TEXT,
+                font=text_font,
+                anchor="rm",
+            )
 
     for index, (x, label) in enumerate(
         _build_time_ticks(history, plot_left, plot_right)
@@ -209,7 +309,7 @@ def _draw_history_chart(
             (x, plot_bottom + 4 + (index % 2) * 18),
             label,
             fill=SUB_TEXT,
-            font=text_font,
+            font=time_font,
             anchor="mt",
         )
 
@@ -234,8 +334,9 @@ def _draw_history_chart(
         points.append((x, y))
 
     for i in range(1, len(points)):
-        draw.line((points[i - 1], points[i]), fill=LINE, width=3)
-    if points:
+        if latencies[i - 1] > 0 and latencies[i] > 0:
+            draw.line((points[i - 1], points[i]), fill=LINE, width=3)
+    if points and latencies[-1] > 0:
         draw.ellipse(
             (
                 points[-1][0] - 4,
@@ -246,6 +347,12 @@ def _draw_history_chart(
             fill=LINE,
         )
 
+    for left_x, right_x, has_left_boundary, has_right_boundary in outage_boundaries:
+        if has_left_boundary:
+            _draw_dashed_vertical_line(draw, left_x, plot_top, plot_bottom)
+        if has_right_boundary:
+            _draw_dashed_vertical_line(draw, right_x, plot_top, plot_bottom)
+
     draw.text(
         (plot_left, plot_top - 18),
         f"max: {max(latencies)}ms",
@@ -254,7 +361,7 @@ def _draw_history_chart(
     )
     draw.text(
         (plot_left + 160, plot_top - 18),
-        f"min: {min(latencies)}ms",
+        f"min: {lmin}ms",
         fill=SUB_TEXT,
         font=text_font,
     )
@@ -291,7 +398,7 @@ async def render_server_report_image(
     *,
     server_name: str,
     server_address: str,
-    latency: int,
+    latency: int | str,
     players_online: int,
     players_max: int,
     server_version: str,
@@ -300,6 +407,7 @@ async def render_server_report_image(
     players: list[dict[str, str]],
     motd: str = "",
     history_title: str = "历史延迟",
+    offline: bool = False,
 ) -> str:
     # 1. 动态计算高度
     player_section_h = max(160, 56 + len(players) * PLAYER_ROW_H + 20)
@@ -348,10 +456,13 @@ async def render_server_report_image(
     draw.text((text_x, PADDING + 18), server_name, fill=TEXT, font=title_font)
     draw.text((text_x, PADDING + 60), server_address, fill=SUB_TEXT, font=key_font)
     draw.text((WIDTH - 300, PADDING + 22), "当前延迟", fill=SUB_TEXT, font=key_font)
+    is_offline = offline or str(latency).strip().lower() == "offline"
+    latency_text = "Offline" if is_offline else f"{latency}ms"
+    latency_color = BAD_COLOR if is_offline else _latency_color(int(latency))
     draw.text(
         (WIDTH - 300, PADDING + 54),
-        f"{latency}ms",
-        fill=_latency_color(latency),
+        latency_text,
+        fill=latency_color,
         font=value_font,
     )
     draw.text((WIDTH - 170, PADDING + 22), "在线人数", fill=SUB_TEXT, font=key_font)
@@ -378,7 +489,7 @@ async def render_server_report_image(
     draw.text((PADDING + 16, motd_top + 40), motd_text, fill=SUB_TEXT, font=motd_font)
 
     # 图表内容
-    _draw_history_chart(draw, chart_rect, history, history_title)
+    _draw_history_chart(draw, chart_rect, history, history_title, image=img)
 
     # 玩家列表内容
     draw.text(

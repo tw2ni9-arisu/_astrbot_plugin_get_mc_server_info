@@ -11,6 +11,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from mcstatus import JavaServer
@@ -166,7 +167,7 @@ def build_render_history(
     history_limit: int,
     silent_query_interval_seconds: int,
 ) -> list[dict[str, int]]:
-    """按历史点顺序右对齐构建固定长度序列，缺失点补零。"""
+    """按时间槽构建固定长度序列，缺失点补零并保留断连间隔。"""
     limit = max(int(history_limit), 1)
     interval = max(int(silent_query_interval_seconds), 1)
     end_ts = int(now_ts if now_ts is not None else time.time())
@@ -183,20 +184,67 @@ def build_render_history(
             latency = int(point.get("latency", 0) or 0)
         except Exception:
             continue
-        if ts <= 0 or ts > end_ts + interval:
+        if ts <= 0 or ts < start_ts - interval or ts > end_ts + interval:
             continue
 
         normalized_points.append((ts, max(latency, 0)))
 
     normalized_points.sort(key=lambda item: item[0])
     normalized_points = normalized_points[-limit:]
-    first_slot = limit - len(normalized_points)
+    previous_slot = -1
+    point_count = len(normalized_points)
     for index, (ts, latency) in enumerate(normalized_points):
-        slot = first_slot + index
+        target_slot = int((ts - start_ts + interval // 2) // interval)
+        target_slot = max(0, min(target_slot, limit - 1))
+        min_slot = previous_slot + 1
+        max_slot = limit - (point_count - index)
+        slot = min(max(target_slot, min_slot), max_slot)
         series[slot]["timestamp"] = ts
         series[slot]["latency"] = latency
+        previous_slot = slot
 
     return series
+
+
+def build_history_status(
+    history_points: list[dict[str, Any]],
+    *,
+    now_ts: int | None = None,
+    window_seconds: int = 24 * 60 * 60,
+) -> dict[str, Any]:
+    """筛选时间窗口内的延迟历史并计算最大值、最小值。"""
+    end_ts = int(now_ts if now_ts is not None else time.time())
+    start_ts = end_ts - max(int(window_seconds), 1)
+    history: list[dict[str, Any]] = []
+
+    for point in history_points:
+        try:
+            timestamp = int(point.get("timestamp", 0) or 0)
+            latency = max(int(point.get("latency", 0) or 0), 0)
+        except Exception:
+            continue
+        if timestamp <= 0 or timestamp < start_ts or timestamp > end_ts:
+            continue
+        history.append(
+            {
+                "timestamp": timestamp,
+                "time": datetime.fromtimestamp(timestamp).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "latency": latency,
+            }
+        )
+
+    history.sort(key=lambda point: point["timestamp"])
+    latencies = [point["latency"] for point in history if point["latency"] > 0]
+    return {
+        "from_timestamp": start_ts,
+        "to_timestamp": end_ts,
+        "history": history,
+        "total": len(history),
+        "max_latency": max(latencies) if latencies else None,
+        "min_latency": min(latencies) if latencies else None,
+    }
 
 
 def build_history_title(

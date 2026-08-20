@@ -97,6 +97,7 @@
 | Tool | 参数 | 功能 |
 |------|------|------|
 | query_mc_server | server | 查询服务器状态，server 可以是已保存名称或地址 |
+| query_history_status | server | 查询已保存服务器近 24 小时的缓存延迟、最大值、最小值及时间点 |
 | add_mc_server | name, address | 添加服务器 |
 | delete_mc_server | server | 删除服务器 |
 | rename_mc_server | old_name, new_name | 重命名服务器 |
