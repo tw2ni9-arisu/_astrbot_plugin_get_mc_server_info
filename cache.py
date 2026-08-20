@@ -7,10 +7,32 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import re
 import shutil
 from pathlib import Path
 
 from .store import address_hash
+
+MAX_ICON_BYTES = 256 * 1024
+PLAYER_UUID_PATTERN = re.compile(
+    r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
+
+
+def is_valid_player_uuid(uid: str) -> bool:
+    """Return whether a player UUID is in a safe compact or dashed form."""
+    return bool(PLAYER_UUID_PATTERN.fullmatch(str(uid or "").strip()))
+
+
+def normalize_player_uid(uid: str, player_name: str = "") -> str:
+    """Keep valid UUIDs and use a stable safe fallback for malformed values."""
+    normalized_uid = str(uid or "").strip().lower()
+    if is_valid_player_uuid(normalized_uid):
+        return normalized_uid
+    fallback_name = str(player_name or normalized_uid)
+    return hashlib.md5(fallback_name.encode("utf-8")).hexdigest()
 
 
 def server_cache_dir(cache_root: Path, address: str) -> Path:
@@ -25,7 +47,8 @@ def icon_cache_path(cache_root: Path, address: str) -> Path:
 
 def skin_cache_path(cache_root: Path, address: str, uid: str) -> Path:
     """玩家头像缓存路径。"""
-    return server_cache_dir(cache_root, address) / "skins" / f"{uid}.png"
+    safe_uid = normalize_player_uid(uid)
+    return server_cache_dir(cache_root, address) / "skins" / f"{safe_uid}.png"
 
 
 def delete_server_cache(cache_root: Path, address: str) -> None:
@@ -52,6 +75,8 @@ async def cache_server_icon(
     try:
         raw = base64.b64decode(payload)
     except Exception:
+        return
+    if len(raw) > MAX_ICON_BYTES:
         return
     icon_path = icon_cache_path(cache_root, address)
     icon_path.parent.mkdir(parents=True, exist_ok=True)

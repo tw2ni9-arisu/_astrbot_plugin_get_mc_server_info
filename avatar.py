@@ -9,16 +9,16 @@ import asyncio
 import contextlib
 import inspect
 import io
-import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
 
 import aiohttp
 from PIL import Image
 
 from astrbot.api import logger
+
+from . import cache as _cache_mod
 
 try:
     import PILSkinMC as _PILSKINMC
@@ -26,6 +26,7 @@ except Exception:
     _PILSKINMC = None
 
 SKIN_SIZE = 32
+MAX_RETRY_AFTER_SECONDS = 30.0
 
 
 async def download_and_render_avatar_by_uuid(
@@ -65,9 +66,7 @@ async def download_and_render_avatar_by_uuid(
                             ):
                                 return True
                             # 即使状态码 200，内容也可能非有效皮肤；直接放弃该候选 UUID
-                            failed_reasons.append(
-                                f"{candidate_uuid}:200_invalid_skin"
-                            )
+                            failed_reasons.append(f"{candidate_uuid}:200_invalid_skin")
                             should_retry = False
                             break
                         # 404 表示该 UUID 没有皮肤记录，尝试下一个 UUID 候选
@@ -101,7 +100,7 @@ async def download_and_render_avatar_by_uuid(
                 break
 
     logger.warning(
-        "avatar download/render failed for uid=%s, reasons=%s",
+        "avatar download/render failed for uid=%r, reasons=%s",
         uid,
         "; ".join(failed_reasons[:6]) if failed_reasons else "unknown",
     )
@@ -208,8 +207,8 @@ def _render_avatar_head_fallback(skin: Image.Image) -> Image.Image:
 
 def build_uuid_candidates(uid: str) -> list[str]:
     """构造 UUID 候选格式（兼容带/不带连字符）。"""
-    raw = (uid or "").strip().lower()
-    if not raw:
+    raw = str(uid or "").strip().lower()
+    if not raw or not _cache_mod.is_valid_player_uuid(raw):
         return []
     candidates: list[str] = []
     if raw not in candidates:
@@ -236,7 +235,7 @@ def parse_retry_after_seconds(retry_after: str | None) -> float | None:
     try:
         # 数字秒（最常见）
         sec = int(raw)
-        return float(max(sec, 0))
+        return min(float(max(sec, 0)), MAX_RETRY_AFTER_SECONDS)
     except ValueError:
         pass
     try:
@@ -245,6 +244,6 @@ def parse_retry_after_seconds(retry_after: str | None) -> float | None:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         delta = (dt - datetime.now(timezone.utc)).total_seconds()
-        return float(max(delta, 0.0))
+        return min(float(max(delta, 0.0)), MAX_RETRY_AFTER_SECONDS)
     except Exception:
         return None

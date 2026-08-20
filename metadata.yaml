@@ -1,7 +1,7 @@
 name: astrbot_plugin_get_mc_server_info
 display_name: 获取 MC 服务器信息
-desc: 会话隔离管理 MC 服务器，支持命令与 LLM Tool 增删改查、重定向、模糊解析、状态与 24 小时历史查询、断连区间图表、模板渲染与缓存管理。
-version: v1.9.0
+desc: 会话隔离管理 MC 服务器，支持命令与 LLM Tool 增删改查、重定向、模糊解析、状态与配置窗口历史查询、断连区间图表、模板渲染与缓存管理。
+version: v1.9.1
 author: TW2NTY_NIN9
 repo: https://github.com/tw2ni9-arisu/_astrbot_plugin_get_mc_server_info
 astrbot_version: ">=4.16,<5"

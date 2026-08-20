@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import re
 import time
 from dataclasses import dataclass
@@ -15,6 +14,9 @@ from datetime import datetime
 from typing import Any
 
 from mcstatus import JavaServer
+
+from . import cache as _cache_mod
+from . import store as _store_mod
 
 MOTD_FORMAT_CODE_PATTERN = re.compile(r"§.")
 
@@ -25,6 +27,10 @@ class McServerConnectionError(RuntimeError):
 
 class McServerTimeoutError(McServerConnectionError):
     """MC server status request timed out."""
+
+
+class McServerInvalidAddressError(McServerConnectionError):
+    """Server address is malformed or targets a non-public network."""
 
 
 @dataclass
@@ -43,6 +49,38 @@ class ServerStatus:
 
 # ---- 服务端查询 ----
 
+
+async def lookup_public_server(address: str) -> JavaServer:
+    """Resolve a Java server and pin the connection to a public IP."""
+    try:
+        fallback_host, fallback_port = _store_mod.parse_server_address(address)
+        server = await JavaServer.async_lookup(address)
+    except _store_mod.InvalidServerAddressError as exc:
+        raise McServerInvalidAddressError(str(exc)) from exc
+    except ValueError as exc:
+        raise McServerInvalidAddressError("server address is invalid") from exc
+
+    server_address = getattr(server, "address", None)
+    target_host = str(getattr(server_address, "host", fallback_host) or "")
+    try:
+        target_port = int(getattr(server_address, "port", fallback_port))
+        public_ip, public_port = await _store_mod.resolve_public_server_target(
+            target_host,
+            target_port,
+        )
+    except (_store_mod.InvalidServerAddressError, TypeError, ValueError) as exc:
+        raise McServerInvalidAddressError(str(exc)) from exc
+
+    try:
+        return JavaServer(
+            public_ip,
+            public_port,
+            timeout=float(getattr(server, "timeout", 3)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise McServerInvalidAddressError("server address is invalid") from exc
+
+
 async def fetch_server_status(
     address: str,
     *,
@@ -51,7 +89,9 @@ async def fetch_server_status(
 ) -> ServerStatus:
     """请求并标准化服务器状态。"""
     try:
-        server = await JavaServer.async_lookup(address)
+        server = await lookup_public_server(address)
+    except McServerInvalidAddressError:
+        raise
     except (TimeoutError, asyncio.TimeoutError) as exc:
         raise McServerTimeoutError("server lookup timed out") from exc
     except OSError as exc:
@@ -60,9 +100,7 @@ async def fetch_server_status(
         raise McServerConnectionError("server lookup failed") from exc
 
     try:
-        status = await asyncio.wait_for(
-            server.async_status(), timeout=status_timeout
-        )
+        status = await asyncio.wait_for(server.async_status(), timeout=status_timeout)
     except (TimeoutError, asyncio.TimeoutError) as exc:
         raise McServerTimeoutError("server status timed out") from exc
     except (OSError, ConnectionError) as exc:
@@ -82,8 +120,7 @@ async def fetch_server_status(
             player_uid = getattr(player, "id", "") or ""
             if not player_name:
                 continue
-            if not player_uid:
-                player_uid = hashlib.md5(player_name.encode("utf-8")).hexdigest()
+            player_uid = _cache_mod.normalize_player_uid(player_uid, player_name)
             players.append({"name": player_name, "uid": player_uid})
 
     latency = int(round(getattr(status, "latency", 0) or 0))
@@ -114,6 +151,7 @@ async def fetch_server_status(
 
 # ---- Motd 提取 ----
 
+
 def extract_motd_text(description: Any) -> str:
     """提取并归一化服务端 Motd。"""
     if description is None:
@@ -123,7 +161,7 @@ def extract_motd_text(description: Any) -> str:
         if callable(to_plain):
             text = strip_minecraft_format_codes(str(to_plain() or "")).strip()
             if text:
-                return text
+                return text[:300]
     except Exception:
         pass
     text = strip_minecraft_format_codes(flatten_motd_node(description)).strip()
@@ -159,6 +197,7 @@ def flatten_motd_node(node: Any) -> str:
 
 
 # ---- 延迟历史构建 ----
+
 
 def build_render_history(
     history_points: list[dict[str, Any]],
@@ -228,9 +267,7 @@ def build_history_status(
         history.append(
             {
                 "timestamp": timestamp,
-                "time": datetime.fromtimestamp(timestamp).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
+                "time": datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S"),
                 "latency": latency,
             }
         )
@@ -255,8 +292,15 @@ def build_history_title(
     points = max(int(history_limit), 1)
     interval = max(int(silent_query_interval_seconds), 1)
     total_seconds = points * interval
-    if total_seconds % 3600 == 0:
-        total_window = f"{total_seconds // 3600}h"
-    else:
-        total_window = f"{total_seconds // 60}m"
+    total_window = format_history_window(total_seconds)
     return f"历史延迟（{total_window} / {points}点）"
+
+
+def format_history_window(window_seconds: int) -> str:
+    """Format a history window for tool responses and render titles."""
+    total_seconds = max(int(window_seconds), 1)
+    if total_seconds % 3600 == 0:
+        return f"{total_seconds // 3600}h"
+    if total_seconds % 60 == 0:
+        return f"{total_seconds // 60}m"
+    return f"{total_seconds}s"

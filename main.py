@@ -14,47 +14,35 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
-import hashlib
-import importlib.util
-import inspect
-import io
 import re
 import shutil
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+import weakref
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 import aiohttp
-from mcstatus import JavaServer
-from PIL import Image
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
-# ---- 模块化拆分导入 ----
-from . import store as _store_mod
+from . import avatar as _avatar_mod
 from . import cache as _cache_mod
 from . import query as _query_mod
-from . import avatar as _avatar_mod
+
+# ---- 模块化拆分导入 ----
+from . import store as _store_mod
 from . import template_loader as _tl_mod
+
 ServerStatus = _query_mod.ServerStatus
 McServerConnectionError = _query_mod.McServerConnectionError
 McServerTimeoutError = _query_mod.McServerTimeoutError
-MOTD_FORMAT_CODE_PATTERN = _query_mod.MOTD_FORMAT_CODE_PATTERN
-
-try:
-    import PILSkinMC as _PILSKINMC
-except Exception:
-    _PILSKINMC = None
+McServerInvalidAddressError = _query_mod.McServerInvalidAddressError
 
 ADD_SERVER_PATTERN = re.compile(r"^/(?:添加服务器|添加)\s+(\S+)\s+(\S+)\s*$")
 QUERY_SERVER_PATTERN = re.compile(r"^/(?:查询服务器|查询)(?:\s+(\S+))?\s*$")
@@ -62,14 +50,13 @@ DELETE_SERVER_PATTERN = re.compile(r"^/(?:删除服务器|删除)\s+(\S+)\s*$")
 RENAME_SERVER_PATTERN = re.compile(r"^/(?:重命名服务器|重命名)\s+(\S+)\s+(\S+)\s*$")
 LIST_SERVER_PATTERN = re.compile(r"^/(?:服务器列表|列表)\s*$")
 TEMPLATE_PATTERN = re.compile(r"^/模板(?:\s+(\S+))?\s*$")
+TEMPLATE_RELOAD_PATTERN = re.compile(r"^/模板重载\s*$")
 REDIRECT_SERVER_PATTERN = re.compile(r"^/重定向\s+(\S+)\s+(\S+)\s*$")
 HELP_PATTERN = re.compile(r"^/(?:帮助|help)\s*$")
 COMMAND_FALLBACK_PATTERN = re.compile(
-    r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+    r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板重载|模板|帮助|help)(?:\s+.*)?$"
 )
 
-# 默认补全端口（Minecraft Java Edition 常见端口）
-DEFAULT_PORT = 25565
 # 是否自动补全默认端口（可被插件配置覆盖）
 AUTO_APPEND_DEFAULT_PORT = False
 # 静默轮询间隔：30 分钟
@@ -80,8 +67,6 @@ HISTORY_LIMIT = 48
 CACHE_TTL_SECONDS = 24 * 60 * 60
 # 向 MC 服务端拉取状态的超时
 STATUS_TIMEOUT = 10
-# 头像下载尺寸（像素）
-SKIN_SIZE = 32
 # 默认渲染模板（对应 templates/default_method.py）
 DEFAULT_TEMPLATE_NAME = "default_method"
 # 离线服务器没有实时 Motd 时使用的默认文本
@@ -100,7 +85,7 @@ QUERY_RESULT_CACHE_TTL_SECONDS = 10
 QUERY_CACHE_CLEANUP_INTERVAL_SECONDS = 5 * 60
 # LLM Tool 返回结构版本
 TOOL_VERSION = "1.2"
-PLUGIN_VERSION = "v1.6.0"
+PLUGIN_VERSION = "v1.9.1"
 # Tool 查询状态缓存，避免 Agent 连续追问时重复打到 MC 服务端
 TOOL_STATUS_CACHE_TTL_SECONDS = 30
 # Tool 列表缓存，避免 Agent 连续追问列表细节时重复读取存储
@@ -110,20 +95,6 @@ TOOL_RATE_LIMIT_WINDOW_SECONDS = 60
 TOOL_RATE_LIMIT_MAX_CALLS = 20
 # Tool 层并发查询上限
 TOOL_QUERY_CONCURRENCY = 3
-
-
-# McServerConnectionError / McServerTimeoutError → 已迁移到 query.py
-
-
-# ServerStatus → 已迁移到 query.py
-
-
-@dataclass
-class TemplateRendererEntry:
-    """模板渲染器缓存项。"""
-
-    mtime: float
-    renderer: Callable[..., Awaitable[str]]
 
 
 @dataclass
@@ -179,7 +150,9 @@ class Main(Star):
         # 模板目录（存放渲染方法）
         self._templates_dir = Path(__file__).resolve().parent / "templates"
         # 模板渲染函数缓存，避免每次查询都重复加载文件
-        self._template_renderer_cache: dict[str, TemplateRendererEntry] = {}
+        self._template_renderer_cache: dict[
+            str, tuple[float, _tl_mod.TemplateRenderer]
+        ] = {}
         # 运行时配置（支持插件配置覆盖）
         self.silent_query_interval_seconds = SILENT_QUERY_INTERVAL_SECONDS
         self.history_limit = HISTORY_LIMIT
@@ -191,12 +164,16 @@ class Main(Star):
         self.skin_api_url_template = SKIN_API_URL_TEMPLATE
         self.auto_append_default_port = AUTO_APPEND_DEFAULT_PORT
         self.query_result_cache_ttl_seconds = QUERY_RESULT_CACHE_TTL_SECONDS
-        self._query_render_cache: dict[str, QueryRenderCacheEntry] = {}
+        self._query_render_cache: dict[
+            tuple[str, str, str, str], QueryRenderCacheEntry
+        ] = {}
         self._tool_status_cache: dict[str, ToolStatusCacheEntry] = {}
         self._tool_list_cache: dict[str, ToolListCacheEntry] = {}
         self._tool_rate_limit_hits: dict[str, list[float]] = {}
         self._tool_query_semaphore = asyncio.Semaphore(TOOL_QUERY_CONCURRENCY)
-        self._avatar_file_locks: dict[str, asyncio.Lock] = {}
+        self._avatar_file_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
 
     async def initialize(self) -> None:
         """插件初始化：创建目录、建立会话、启动后台任务。"""
@@ -265,8 +242,7 @@ class Main(Star):
         )
         if result.get("error") == "INVALID_ADDRESS":
             yield event.plain_result(
-                "添加失败！服务器地址端口无效，请使用 host 或 host:数字端口，"
-                "或在配置中开启 auto_append_default_port。"
+                "添加失败！服务器地址无效或指向内网/保留网络，请使用公网 host 或 host:数字端口"
             )
             return
         if result.get("error") == "CONNECTION_FAILED":
@@ -330,7 +306,9 @@ class Main(Star):
             # 未命中已添加的服务器名称时，尝试按地址直连查询；
             # 若输入看起来是名称而非地址，则直接反馈不存在。
             if "." not in query_token and ":" not in query_token:
-                yield event.plain_result(f"当前会话内不存在名为 [{query_token}] 的服务器")
+                yield event.plain_result(
+                    f"当前会话内不存在名为 [{query_token}] 的服务器"
+                )
                 return
 
             yield await self._query_direct_address(
@@ -368,9 +346,11 @@ class Main(Star):
             yield event.plain_result(output)
             return
 
-        # 手动清理模板缓存：/模板 reload
-        if template_name == "reload":
-            await self._switch_template_data(event.unified_msg_origin, template_name)
+        if (
+            template_name == "reload"
+            and not self._template_file_path(template_name).is_file()
+        ):
+            self._reload_template_caches()
             yield event.plain_result("模板缓存已重载")
             return
 
@@ -385,6 +365,15 @@ class Main(Star):
             return
 
         yield event.plain_result(f"已切换至 {template_name}")
+
+    @filter.regex(r"^/模板重载\s*$")
+    async def reload_templates(self, event: AstrMessageEvent):
+        """Reload template and rendered-image caches."""
+        if self._should_ignore_self_event(event):
+            return
+
+        self._reload_template_caches()
+        yield event.plain_result("模板缓存已重载")
 
     @filter.regex(r"^/(?:重命名服务器|重命名)\s+\S+\s+\S+\s*$")
     async def rename_server(self, event: AstrMessageEvent):
@@ -526,6 +515,7 @@ class Main(Star):
             RENAME_SERVER_PATTERN,
             LIST_SERVER_PATTERN,
             TEMPLATE_PATTERN,
+            TEMPLATE_RELOAD_PATTERN,
             REDIRECT_SERVER_PATTERN,
         )
         if any(pattern.match(message) for pattern in valid_patterns):
@@ -544,7 +534,9 @@ class Main(Star):
             return
         server_name = matched.group(1).strip()
         new_raw_address = matched.group(2).strip()
-        result = await self._redirect_server_data(event.unified_msg_origin, server_name, new_raw_address)
+        result = await self._redirect_server_data(
+            event.unified_msg_origin, server_name, new_raw_address
+        )
         if result.get("error") == "SERVER_NOT_FOUND":
             yield event.plain_result(f'重定向失败！服务器 "{server_name}" 不存在')
             return
@@ -560,12 +552,14 @@ class Main(Star):
             yield event.plain_result("重定向失败！新地址无法连接")
             return
         if result.get("error") == "INVALID_ADDRESS":
-            yield event.plain_result("重定向失败！新地址端口无效")
+            yield event.plain_result("重定向失败！新地址无效或指向内网/保留网络")
             return
         if not result.get("ok"):
             yield event.plain_result("重定向失败！")
             return
-        yield event.plain_result(f"{result['server_name']} 重定向 {result['old_address']} -> {result['new_address']}，新地址延迟: {result['latency']} ms")
+        yield event.plain_result(
+            f"{result['server_name']} 重定向 {result['old_address']} -> {result['new_address']}，新地址延迟: {result['latency']} ms"
+        )
 
     @filter.llm_tool(name="query_mc_server")
     async def query_mc_server_tool(
@@ -608,10 +602,11 @@ class Main(Star):
     async def query_history_status_tool(
         self, event: AstrMessageEvent, server: str
     ) -> dict[str, Any]:
-        """查询已保存 Minecraft 服务器近 24 小时的缓存延迟历史。
+        """查询已保存 Minecraft 服务器在当前配置窗口内的缓存延迟历史。
 
-        当用户询问某个服务器近 24 小时的延迟趋势、最高延迟、最低延迟
-        或历史延迟记录时调用。server 只能传当前会话中已保存的服务器名称。
+        当用户询问某个服务器的延迟趋势、最高延迟、最低延迟或历史延迟
+        记录时调用。窗口由历史点数与静默轮询间隔共同决定。server 只能传
+        当前会话中已保存的服务器名称。
 
         Args:
             server(string): 已保存的服务器名称，例如：生存服、测试服。
@@ -782,7 +777,6 @@ class Main(Star):
 
         Examples:
             default_method
-            reload
 
         不要用于切换 Minecraft 客户端版本、Java 版本、材质包、
         光影包、Mod 或服务器自身插件。
@@ -836,7 +830,9 @@ class Main(Star):
             return self._tool_internal_error("resolve_server_name", exc)
 
     @filter.llm_tool(name="redirect_mc_server")
-    async def redirect_mc_server_tool(self, event: AstrMessageEvent, name: str, new_address: str) -> dict[str, Any]:
+    async def redirect_mc_server_tool(
+        self, event: AstrMessageEvent, name: str, new_address: str
+    ) -> dict[str, Any]:
         """重定向已保存的 Minecraft 服务器到新地址。更换前会先验证新地址能否连接。
 
         Args:
@@ -945,6 +941,7 @@ class Main(Star):
 
     def _cleanup_tool_caches(self) -> int:
         now = time.time()
+        window_start = time.monotonic() - TOOL_RATE_LIMIT_WINDOW_SECONDS
         removed = 0
         for key, entry in list(self._tool_status_cache.items()):
             if entry.expires_at <= now:
@@ -954,6 +951,13 @@ class Main(Star):
             if entry.expires_at <= now:
                 self._tool_list_cache.pop(key, None)
                 removed += 1
+        for actor_key, hits in list(self._tool_rate_limit_hits.items()):
+            active_hits = [hit for hit in hits if hit >= window_start]
+            removed += len(hits) - len(active_hits)
+            if active_hits:
+                self._tool_rate_limit_hits[actor_key] = active_hits
+            else:
+                self._tool_rate_limit_hits.pop(actor_key, None)
         return removed
 
     @staticmethod
@@ -1034,6 +1038,16 @@ class Main(Star):
 
         try:
             status = await self._fetch_server_status(address, need_players=False)
+        except McServerInvalidAddressError:
+            return {
+                "ok": False,
+                "online": False,
+                "server": display_name,
+                "address": address,
+                "managed": managed,
+                "error": "INVALID_ADDRESS",
+                "message": "server address must resolve to public IP addresses",
+            }
         except McServerTimeoutError:
             return {
                 "ok": False,
@@ -1091,7 +1105,7 @@ class Main(Star):
     async def _query_history_status_data(
         self, session_key: str, server: str
     ) -> dict[str, Any]:
-        """读取当前会话中指定服务器近 24 小时的缓存延迟历史。"""
+        """读取当前会话中指定服务器在配置窗口内的缓存延迟历史。"""
         query_name = (server or "").strip()
         if not query_name:
             return {
@@ -1103,12 +1117,8 @@ class Main(Star):
         async with self._store_lock:
             store = await self._load_store()
             session_obj = self._get_or_create_session(store, session_key)
-            servers: dict[str, dict[str, Any]] = dict(
-                session_obj.get("servers", {})
-            )
-            matched_addresses = self._find_server_addresses_by_name(
-                servers, query_name
-            )
+            servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
+            matched_addresses = self._find_server_addresses_by_name(servers, query_name)
             if not matched_addresses:
                 return {
                     "ok": False,
@@ -1130,21 +1140,29 @@ class Main(Star):
             if not isinstance(history_points, list):
                 history_points = []
 
-        history_status = _query_mod.build_history_status(history_points)
+        window_seconds = max(int(self.history_limit), 1) * max(
+            int(self.silent_query_interval_seconds), 1
+        )
+        window = _query_mod.format_history_window(window_seconds)
+        history_status = _query_mod.build_history_status(
+            history_points,
+            window_seconds=window_seconds,
+        )
         message = (
-            f"服务器“{query_name}”近24小时暂无缓存延迟记录"
+            f"服务器“{query_name}”近{window}暂无缓存延迟记录"
             if not history_status["history"]
             else (
-                f"服务器“{query_name}”近24小时暂无有效延迟记录"
+                f"服务器“{query_name}”近{window}暂无有效延迟记录"
                 if history_status["max_latency"] is None
-                else f"已返回服务器“{query_name}”近24小时缓存延迟记录"
+                else f"已返回服务器“{query_name}”近{window}缓存延迟记录"
             )
         )
         return {
             "ok": True,
             "server": query_name,
             "address": address,
-            "window": "24h",
+            "window": window,
+            "window_seconds": window_seconds,
             "message": message,
             **history_status,
         }
@@ -1175,6 +1193,14 @@ class Main(Star):
         address = self._normalize_address(raw_address)
         try:
             status = await self._fetch_server_status(address, need_players=False)
+        except McServerInvalidAddressError:
+            return {
+                "ok": False,
+                "server": desired_name,
+                "address": address,
+                "error": "INVALID_ADDRESS",
+                "message": "server address must resolve to public IP addresses",
+            }
         except McServerTimeoutError:
             return {
                 "ok": False,
@@ -1410,17 +1436,27 @@ class Main(Star):
             "name_adjusted": name_duplicated,
         }
 
-    async def _redirect_server_data(self, session_key: str, server_name: str, new_raw_address: str) -> dict[str, Any]:
+    async def _redirect_server_data(
+        self, session_key: str, server_name: str, new_raw_address: str
+    ) -> dict[str, Any]:
         """重定向已保存服务器到新地址（先验证新地址可连再更新）。"""
         server_name = (server_name or "").strip()
         new_raw_address = (new_raw_address or "").strip()
         if not server_name or not new_raw_address:
-            return {"ok": False, "error": "INVALID_ARGUMENT",
-                    "message": "name and new_address are required"}
+            return {
+                "ok": False,
+                "error": "INVALID_ARGUMENT",
+                "message": "name and new_address are required",
+            }
         new_address = self._normalize_address(new_raw_address)
-        if not self.auto_append_default_port and self._has_invalid_port_segment(new_raw_address):
-            return {"ok": False, "error": "INVALID_ADDRESS",
-                    "message": "new address port is invalid"}
+        if not self.auto_append_default_port and self._has_invalid_port_segment(
+            new_raw_address
+        ):
+            return {
+                "ok": False,
+                "error": "INVALID_ADDRESS",
+                "message": "new address port is invalid",
+            }
 
         # 1) 先在锁内查服务器信息，但不在锁内做网络 I/O
         async with self._store_lock:
@@ -1429,27 +1465,46 @@ class Main(Star):
             servers = session_obj["servers"]
             matched = self._find_server_addresses_by_name(servers, server_name)
             if not matched:
-                return {"ok": False, "server_name": server_name,
-                        "error": "SERVER_NOT_FOUND",
-                        "message": f"server '{server_name}' not found"}
+                return {
+                    "ok": False,
+                    "server_name": server_name,
+                    "error": "SERVER_NOT_FOUND",
+                    "message": f"server '{server_name}' not found",
+                }
             if len(matched) > 1:
-                return {"ok": False, "server_name": server_name,
-                        "error": "AMBIGUOUS_SERVER_NAME",
-                        "message": f"multiple saved servers use name '{server_name}'"}
+                return {
+                    "ok": False,
+                    "server_name": server_name,
+                    "error": "AMBIGUOUS_SERVER_NAME",
+                    "message": f"multiple saved servers use name '{server_name}'",
+                }
             old_address = matched[0]
             old_server = dict(servers[old_address])  # 浅拷贝，避免持锁操作
 
         # 2) 锁外验证新地址（网络 I/O，不阻塞其他操作）
         try:
             status = await self._fetch_server_status(new_address, need_players=False)
+        except McServerInvalidAddressError:
+            return {
+                "ok": False,
+                "server_name": server_name,
+                "error": "INVALID_ADDRESS",
+                "message": "new address must resolve to public IP addresses",
+            }
         except McServerTimeoutError:
-            return {"ok": False, "server_name": server_name,
-                    "error": "CONNECTION_TIMEOUT",
-                    "message": "new address connection timed out"}
+            return {
+                "ok": False,
+                "server_name": server_name,
+                "error": "CONNECTION_TIMEOUT",
+                "message": "new address connection timed out",
+            }
         except McServerConnectionError:
-            return {"ok": False, "server_name": server_name,
-                    "error": "CONNECTION_FAILED",
-                    "message": "new address connection failed"}
+            return {
+                "ok": False,
+                "server_name": server_name,
+                "error": "CONNECTION_FAILED",
+                "message": "new address connection failed",
+            }
 
         # 3) 锁内快速写入
         async with self._store_lock:
@@ -1459,36 +1514,49 @@ class Main(Star):
 
             # 二次校验：服务器是否仍存在
             if old_address not in servers:
-                return {"ok": False, "server_name": server_name,
-                        "error": "SERVER_NOT_FOUND",
-                        "message": "server was removed during redirect"}
+                return {
+                    "ok": False,
+                    "server_name": server_name,
+                    "error": "SERVER_NOT_FOUND",
+                    "message": "server was removed during redirect",
+                }
 
             # 地址冲突检测
             if new_address != old_address and new_address in servers:
                 conflict_name = servers[new_address].get("name", new_address)
-                return {"ok": False, "server_name": server_name,
-                        "error": "SERVER_ALREADY_EXISTS",
-                        "message": f"new address already used by '{conflict_name}'"}
+                return {
+                    "ok": False,
+                    "server_name": server_name,
+                    "error": "SERVER_ALREADY_EXISTS",
+                    "message": f"new address already used by '{conflict_name}'",
+                }
 
             del servers[old_address]
             servers[new_address] = old_server
             servers[new_address]["address"] = new_address
             servers[new_address]["motd"] = str(status.motd or "")
+            servers[new_address]["last_latency"] = status.latency
             try:
                 await self._save_store(store)
             except Exception as exc:
                 logger.exception("redirect save failed: %s", exc)
-                return {"ok": False, "server_name": server_name,
-                        "error": "SAVE_FAILED",
-                        "message": "server save failed"}
+                return {
+                    "ok": False,
+                    "server_name": server_name,
+                    "error": "SAVE_FAILED",
+                    "message": "server save failed",
+                }
 
         self._clear_tool_status_cache(session_key)
         self._clear_tool_list_cache(session_key)
         self._clear_query_render_cache(session_key, old_address)
-        return {"ok": True,
-                "server_name": old_server.get("name", server_name),
-                "old_address": old_address, "new_address": new_address,
-                "latency": status.latency}
+        return {
+            "ok": True,
+            "server_name": old_server.get("name", server_name),
+            "old_address": old_address,
+            "new_address": new_address,
+            "latency": status.latency,
+        }
 
     async def _list_servers_data(self, session_key: str) -> list[dict[str, Any]]:
         """List saved servers as JSON-serializable data for LLM tools."""
@@ -1589,14 +1657,6 @@ class Main(Star):
                 "message": "template is required",
                 "available_templates": self._list_templates(),
             }
-        if template_name == "reload":
-            self._template_renderer_cache.clear()
-            return {
-                "ok": True,
-                "template": template_name,
-                "reloaded": True,
-                "available_templates": self._list_templates(),
-            }
         if not self._is_valid_template_name(template_name):
             return {
                 "ok": False,
@@ -1688,6 +1748,21 @@ class Main(Star):
         if not server_obj:
             return event.plain_result("查询失败！群聊内无该服务器")
 
+        server_name = str(server_obj.get("name", address) or address)
+        cache_key = self._build_query_cache_key(
+            session_key=session_key,
+            address=address,
+            template_name=template_name,
+            mode="managed",
+        )
+        cached_image = self._try_get_query_render_cache(cache_key)
+        if cached_image is not None:
+            return (
+                event.make_result()
+                .message(f"缓存结果（{self.query_result_cache_ttl_seconds}秒内）")
+                .base64_image(cached_image)
+            )
+
         # 1) 拉取服务端状态（含玩家 sample）
         try:
             status = await self._fetch_server_status(address, need_players=True)
@@ -1704,7 +1779,7 @@ class Main(Star):
             renderer = await self._get_template_renderer(template_name)
             image_b64 = await self._call_template_renderer(
                 renderer,
-                server_name=str(server_obj.get("name", address)),
+                server_name=server_name,
                 server_address=address,
                 latency="Offline",
                 offline=True,
@@ -1737,20 +1812,6 @@ class Main(Star):
             history = list(real_server_obj["latency_history"])
             await self._save_store(store)
 
-        cache_key = self._build_query_cache_key(
-            session_key=session_key,
-            address=address,
-            template_name=template_name,
-            mode="managed",
-        )
-        cached_image = self._try_get_query_render_cache(cache_key)
-        if cached_image is not None:
-            return (
-                event.make_result()
-                .message(f"缓存结果（{self.query_result_cache_ttl_seconds}秒内）")
-                .base64_image(cached_image)
-            )
-
         # 3) 刷新图标与玩家头像缓存，清理过期缓存并生成渲染图
         await self._cache_server_icon(address, status.icon_base64)
         players_for_render = await self._cache_and_collect_player_avatars(
@@ -1763,7 +1824,7 @@ class Main(Star):
         renderer = await self._get_template_renderer(template_name)
         image_b64 = await self._call_template_renderer(
             renderer,
-            server_name=server_obj["name"],
+            server_name=server_name,
             server_address=address,
             latency=status.latency,
             players_online=status.players_online,
@@ -1795,12 +1856,6 @@ class Main(Star):
             template_name=template_name,
             mode="direct",
         )
-        try:
-            status = await self._fetch_server_status(address, need_players=True)
-        except Exception:
-            self._clear_query_render_cache(session_key, address)
-            return event.plain_result(f"服务器 [{address}] 查询失败！")
-
         cached_image = self._try_get_query_render_cache(cache_key)
         if cached_image is not None:
             return (
@@ -1809,10 +1864,22 @@ class Main(Star):
                 .base64_image(cached_image)
             )
 
+        try:
+            status = await self._fetch_server_status(address, need_players=True)
+        except McServerInvalidAddressError:
+            self._clear_query_render_cache(session_key, address)
+            return event.plain_result(
+                f"服务器 [{address}] 地址不允许查询内网或保留网络"
+            )
+        except Exception:
+            self._clear_query_render_cache(session_key, address)
+            return event.plain_result(f"服务器 [{address}] 查询失败！")
+
         now = int(time.time())
         await self._cache_server_icon(address, status.icon_base64)
         players_for_render = await self._cache_and_collect_player_avatars(
-            address, status.players,
+            address,
+            status.players,
         )
         await self._cleanup_expired_cache()
 
@@ -1865,6 +1932,7 @@ class Main(Star):
 
         async def _query_one(address: str, server_obj: dict[str, Any]):
             async with semaphore:
+                server_name = str(server_obj.get("name", address) or address)
                 try:
                     status = await self._fetch_server_status(
                         address, need_players=False
@@ -1875,7 +1943,7 @@ class Main(Star):
                         address,
                         server_obj,
                         None,
-                        f"服务器 [{server_obj['name']}] 查询失败！",
+                        f"服务器 [{server_name}] 查询失败！",
                     )
 
         queried = await asyncio.gather(
@@ -1892,8 +1960,9 @@ class Main(Star):
                 continue
             assert status is not None
             successful_status[address] = status
+            server_name = str(server_obj.get("name", address) or address)
             results.append(
-                f"{server_obj['name']}: 延迟 : {status.latency}ms | 玩家人数 : {status.players_online}/{status.players_max}"
+                f"{server_name}: 延迟 : {status.latency}ms | 玩家人数 : {status.players_online}/{status.players_max}"
             )
             await self._cache_server_icon(address, status.icon_base64)
 
@@ -1980,95 +2049,16 @@ class Main(Star):
         *,
         need_players: bool,
     ) -> ServerStatus:
-        """请求并标准化服务器状态。
-
-        Args:
-            address: host:port 形式地址
-            need_players: 是否读取在线玩家 sample（主动单服查询时为 True）
-        """
-        try:
-            server = await JavaServer.async_lookup(address)
-        except (TimeoutError, asyncio.TimeoutError) as exc:
-            raise McServerTimeoutError("server lookup timed out") from exc
-        except OSError as exc:
-            raise McServerConnectionError("server lookup failed") from exc
-        except Exception as exc:
-            raise McServerConnectionError("server lookup failed") from exc
-
-        try:
-            status = await asyncio.wait_for(
-                server.async_status(), timeout=self.status_timeout_seconds
-            )
-        except (TimeoutError, asyncio.TimeoutError) as exc:
-            raise McServerTimeoutError("server status timed out") from exc
-        except (OSError, ConnectionError) as exc:
-            raise McServerConnectionError("server status failed") from exc
-        except Exception as exc:
-            raise McServerConnectionError("server status failed") from exc
-
-        # favicon 通常是 data:image/png;base64,xxxxx
-        icon_base64 = None
-        if getattr(status, "favicon", None):
-            icon_base64 = str(status.favicon)
-
-        players: list[dict[str, str]] = []
-        if need_players:
-            sample_players = getattr(status.players, "sample", None) or []
-            for player in sample_players:
-                player_name = getattr(player, "name", "") or ""
-                player_uid = getattr(player, "id", "") or ""
-                if not player_name:
-                    continue
-                # 若服务端未返回 UUID，退化为 name 的稳定散列，便于缓存命名
-                if not player_uid:
-                    player_uid = hashlib.md5(player_name.encode("utf-8")).hexdigest()
-                players.append({"name": player_name, "uid": player_uid})
-
-        # async_ping() 测量的是轻量协议往返，比 async_status() 更接近
-        # 游戏内显示的延迟（不包含服务端 JSON 序列化开销）
-        latency = int(round(getattr(status, "latency", 0) or 0))
-        try:
-            ping_latency = await asyncio.wait_for(
-                server.async_ping(), timeout=min(5, self.status_timeout_seconds)
-            )
-            if ping_latency > 0:
-                latency = int(round(ping_latency))
-        except Exception:
-            pass  # ping 失败时回退到 status.latency
-
-        version = (
-            getattr(status.version, "name", "Unknown") if status.version else "Unknown"
-        )
-        motd = self._extract_motd_text(getattr(status, "description", None))
-        return ServerStatus(
+        """Delegate status fetching to the query module."""
+        return await _query_mod.fetch_server_status(
             address=address,
-            latency=max(latency, 0),
-            version=version,
-            players_online=int(getattr(status.players, "online", 0) or 0),
-            players_max=int(getattr(status.players, "max", 0) or 0),
-            icon_base64=icon_base64,
-            players=players,
-            motd=motd,
+            need_players=need_players,
+            status_timeout=self.status_timeout_seconds,
         )
 
     async def _cache_server_icon(self, address: str, icon_base64: str | None) -> None:
-        """缓存服务器图标（icon.png）。
-
-        图标缓存失败不抛错，避免影响主业务链路。
-        """
-        if not icon_base64:
-            return
-        payload = icon_base64
-        if "," in payload:
-            payload = payload.split(",", 1)[1]
-        try:
-            raw = base64.b64decode(payload)
-        except Exception:
-            return
-
-        icon_path = self._icon_cache_path(address)
-        icon_path.parent.mkdir(parents=True, exist_ok=True)
-        icon_path.write_bytes(raw)
+        """Delegate icon caching to the cache module."""
+        await _cache_mod.cache_server_icon(self._cache_root, address, icon_base64)
 
     async def _cache_and_collect_player_avatars(
         self,
@@ -2093,7 +2083,7 @@ class Main(Star):
 
         async def _resolve_one(player: dict[str, str]) -> dict[str, str]:
             name = player["name"]
-            uid = player["uid"]
+            uid = _cache_mod.normalize_player_uid(player.get("uid", ""), name)
             avatar_path = self._skin_cache_path(address, uid)
             avatar_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2114,10 +2104,13 @@ class Main(Star):
                     and now - int(avatar_path.stat().st_mtime) <= self.cache_ttl_seconds
                 ):
                     return {"name": name, "avatar_path": str(avatar_path)}
-                _ = await self._download_and_render_avatar_by_uuid(
+                _ = await _avatar_mod.download_and_render_avatar_by_uuid(
                     uid=uid,
                     avatar_path=avatar_path,
+                    skin_api_url_template=self.skin_api_url_template,
+                    avatar_download_retries=self.avatar_download_retries,
                     semaphore=semaphore,
+                    session=self._session,
                 )
 
             return {
@@ -2148,8 +2141,16 @@ class Main(Star):
             if not cache_dir.exists():
                 continue
 
-            last_active_query_at = int(server_obj.get("last_active_query_at", 0) or 0)
-            created_at = int(server_obj.get("created_at", 0) or 0)
+            try:
+                last_active_query_at = int(
+                    server_obj.get("last_active_query_at", 0) or 0
+                )
+            except Exception:
+                last_active_query_at = 0
+            try:
+                created_at = int(server_obj.get("created_at", 0) or 0)
+            except Exception:
+                created_at = 0
             # 以“最近一次主动查询时间”为准；若从未主动查询，则回退到创建时间。
             # 这样可满足“24h 内未查询则清理该服务器全部缓存”的需求。
             last_touch_ts = (
@@ -2213,7 +2214,8 @@ class Main(Star):
         data = await self.get_kv_data("session_servers", {"sessions": {}})
         if not isinstance(data, dict):
             return {"sessions": {}}
-        data.setdefault("sessions", {})
+        if not isinstance(data.get("sessions"), dict):
+            data["sessions"] = {}
         return data
 
     async def _save_store(self, data: dict[str, Any]) -> None:
@@ -2228,7 +2230,10 @@ class Main(Star):
         current = await self.get_kv_data("session_servers", {"sessions": {}})
         if not isinstance(current, dict):
             current = {"sessions": {}}
-        current_sessions = current.setdefault("sessions", {})
+        current_sessions = current.get("sessions")
+        if not isinstance(current_sessions, dict):
+            current_sessions = {}
+            current["sessions"] = current_sessions
         incoming_sessions = data.get("sessions", {})
         if isinstance(incoming_sessions, dict):
             current_sessions.update(incoming_sessions)
@@ -2238,12 +2243,8 @@ class Main(Star):
     def _get_or_create_session(
         store: dict[str, Any], session_key: str
     ) -> dict[str, Any]:
-        """获取或初始化会话对象。"""
-        sessions = store.setdefault("sessions", {})
-        session_obj = sessions.setdefault(session_key, {})
-        session_obj.setdefault("servers", {})
-        session_obj.setdefault("template", DEFAULT_TEMPLATE_NAME)
-        return session_obj
+        """Delegate session normalization to the store module."""
+        return _store_mod.get_or_create_session(store, session_key)
 
     def _list_templates(self) -> list[str]:
         """委托到 template_loader 模块。"""
@@ -2260,43 +2261,13 @@ class Main(Star):
 
     async def _get_template_renderer(
         self, template_name: str
-    ) -> Callable[..., Awaitable[str]]:
-        """获取模板渲染函数。
-
-        约定模板文件必须提供：
-            async def render_server_report_image(...)
-        """
-        if not self._is_valid_template_name(template_name):
-            raise ValueError("invalid template name")
-
-        template_file = self._template_file_path(template_name)
-        if not template_file.exists():
-            raise FileNotFoundError(str(template_file))
-        current_mtime = template_file.stat().st_mtime
-
-        cached = self._template_renderer_cache.get(template_name)
-        if cached and cached.mtime == current_mtime:
-            return cached.renderer
-
-        module_name = f"astrbot_plugin_get_mc_server_info_template_{template_name}"
-        spec = importlib.util.spec_from_file_location(module_name, template_file)
-        if not spec or not spec.loader:
-            raise RuntimeError("cannot build module spec")
-
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-        renderer = getattr(module, "render_server_report_image", None)
-        if not renderer or not callable(renderer):
-            raise AttributeError("missing render_server_report_image")
-        if not inspect.iscoroutinefunction(renderer):
-            raise TypeError("render_server_report_image must be async")
-
-        self._template_renderer_cache[template_name] = TemplateRendererEntry(
-            mtime=current_mtime,
-            renderer=renderer,
+    ) -> _tl_mod.TemplateRenderer:
+        """Delegate renderer loading to the template loader module."""
+        return await _tl_mod.get_template_renderer(
+            template_name,
+            self._templates_dir,
+            self._template_renderer_cache,
         )
-        return renderer
 
     def _load_runtime_config(self) -> None:
         """读取插件配置并覆盖运行时参数。"""
@@ -2350,11 +2321,11 @@ class Main(Star):
 
     def _get_config_int(self, key: str, default: int, *, min_value: int = 0) -> int:
         """读取整型配置并做下限保护。"""
-        raw = None
-        if hasattr(self._plugin_config, "get"):
-            raw = self._plugin_config.get(key, default)
-        elif isinstance(self._plugin_config, dict):
-            raw = self._plugin_config.get(key, default)
+        raw = (
+            self._plugin_config.get(key, default)
+            if hasattr(self._plugin_config, "get")
+            else default
+        )
         if raw is None:
             return default
         try:
@@ -2407,11 +2378,13 @@ class Main(Star):
     def _append_latency(
         self, server_obj: dict[str, Any], latency: int, now_ts: int
     ) -> None:
-        """追加延迟历史并裁剪到固定长度。"""
-        history = server_obj.setdefault("latency_history", [])
-        history.append({"timestamp": now_ts, "latency": int(latency)})
-        if len(history) > self.history_limit:
-            server_obj["latency_history"] = history[-self.history_limit :]
+        """Delegate latency retention to the store module."""
+        _store_mod.append_latency(
+            server_obj,
+            latency,
+            now_ts,
+            self.history_limit,
+        )
 
     def _build_render_history(
         self,
@@ -2419,43 +2392,14 @@ class Main(Star):
         *,
         now_ts: int | None = None,
     ) -> list[dict[str, int]]:
-        """按时间槽构建固定长度序列，缺失点补零并保留断连间隔。"""
-        limit = max(int(self.history_limit), 1)
-        interval = max(int(self.silent_query_interval_seconds), 1)
-        end_ts = int(now_ts if now_ts is not None else time.time())
-        start_ts = end_ts - (limit - 1) * interval
+        """Delegate render-history construction to the query module."""
+        return _query_mod.build_render_history(
+            history_points,
+            now_ts=now_ts,
+            history_limit=self.history_limit,
+            silent_query_interval_seconds=self.silent_query_interval_seconds,
+        )
 
-        series = [
-            {"timestamp": start_ts + index * interval, "latency": 0}
-            for index in range(limit)
-        ]
-        normalized_points: list[tuple[int, int]] = []
-        for point in history_points:
-            try:
-                ts = int(point.get("timestamp", 0) or 0)
-                latency = int(point.get("latency", 0) or 0)
-            except Exception:
-                continue
-            if ts <= 0 or ts < start_ts - interval or ts > end_ts + interval:
-                continue
-
-            normalized_points.append((ts, max(latency, 0)))
-
-        normalized_points.sort(key=lambda item: item[0])
-        normalized_points = normalized_points[-limit:]
-        previous_slot = -1
-        point_count = len(normalized_points)
-        for index, (ts, latency) in enumerate(normalized_points):
-            target_slot = int((ts - start_ts + interval // 2) // interval)
-            target_slot = max(0, min(target_slot, limit - 1))
-            min_slot = previous_slot + 1
-            max_slot = limit - (point_count - index)
-            slot = min(max(target_slot, min_slot), max_slot)
-            series[slot]["timestamp"] = ts
-            series[slot]["latency"] = latency
-            previous_slot = slot
-
-        return series
     @staticmethod
     def _find_server_addresses_by_name(
         servers: dict[str, dict[str, Any]], query_name: str
@@ -2541,43 +2485,32 @@ class Main(Star):
             "/列表\n"
             "/重定向 <服务器名称> <新地址>\n"
             "/模板 [模板名|reload]\n"
+            "/模板重载\n"
             "/帮助 或 /help"
         )
 
     @staticmethod
     def _has_invalid_port_segment(address: str) -> bool:
-        """校验简单 host:port 形式下的端口是否合法。"""
-        raw = (address or "").strip()
-        if raw.count(":") != 1:
-            return False
-        host, port_str = raw.rsplit(":", 1)
-        if not host:
+        """Return whether the server address syntax or port is invalid."""
+        try:
+            _store_mod.parse_server_address(address)
+        except _store_mod.InvalidServerAddressError:
             return True
-        return not port_str.isdigit()
+        return False
 
     def _build_history_title(self) -> str:
         """委托到 query 模块。"""
-        return _query_mod.build_history_title(self.history_limit, self.silent_query_interval_seconds)
+        return _query_mod.build_history_title(
+            self.history_limit, self.silent_query_interval_seconds
+        )
 
     async def _call_template_renderer(
         self,
-        renderer: Callable[..., Awaitable[str]],
+        renderer: _tl_mod.TemplateRenderer,
         **kwargs: Any,
     ) -> str:
-        """按模板函数签名过滤参数，兼容旧模板。"""
-        try:
-            sig = inspect.signature(renderer)
-        except Exception:
-            return await renderer(**kwargs)
-
-        accepts_kwargs = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        )
-        if accepts_kwargs:
-            return await renderer(**kwargs)
-
-        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        return await renderer(**filtered)
+        """Delegate signature adaptation to the template loader module."""
+        return await _tl_mod.call_template_renderer(renderer, **kwargs)
 
     @staticmethod
     def _build_query_cache_key(
@@ -2586,10 +2519,12 @@ class Main(Star):
         address: str,
         template_name: str,
         mode: str,
-    ) -> str:
-        return f"{session_key}|{address}|{template_name}|{mode}"
+    ) -> tuple[str, str, str, str]:
+        return session_key, address, template_name, mode
 
-    def _try_get_query_render_cache(self, cache_key: str) -> str | None:
+    def _try_get_query_render_cache(
+        self, cache_key: tuple[str, str, str, str]
+    ) -> str | None:
         now = time.time()
         entry = self._query_render_cache.get(cache_key)
         if not entry:
@@ -2599,16 +2534,23 @@ class Main(Star):
             return None
         return entry.image_b64
 
-    def _set_query_render_cache(self, cache_key: str, image_b64: str) -> None:
+    def _set_query_render_cache(
+        self,
+        cache_key: tuple[str, str, str, str],
+        image_b64: str,
+    ) -> None:
         self._query_render_cache[cache_key] = QueryRenderCacheEntry(
             expires_at=time.time() + float(self.query_result_cache_ttl_seconds),
             image_b64=image_b64,
         )
 
+    def _reload_template_caches(self) -> None:
+        self._template_renderer_cache.clear()
+        self._query_render_cache.clear()
+
     def _clear_query_render_cache(self, session_key: str, address: str) -> None:
-        prefix = f"{session_key}|{address}|"
         for key in list(self._query_render_cache.keys()):
-            if key.startswith(prefix):
+            if key[0] == session_key and key[1] == address:
                 self._query_render_cache.pop(key, None)
 
     def _cleanup_query_render_cache(self) -> int:
@@ -2632,170 +2574,3 @@ class Main(Star):
             except Exception as exc:
                 logger.debug("cache cleanup failed: %s", exc)
             await asyncio.sleep(QUERY_CACHE_CLEANUP_INTERVAL_SECONDS)
-    def _extract_motd_text(self, description: Any) -> str:
-        """提取并归一化服务端 Motd。"""
-        return _query_mod.extract_motd_text(description)
-
-    def _strip_minecraft_format_codes(text: str) -> str:
-        """委托到 query 模块。"""
-        return _query_mod.strip_minecraft_format_codes(text)
-
-    def _flatten_motd_node(self, node: Any) -> str:
-        return _query_mod.flatten_motd_node(node)
-
-    async def _download_and_render_avatar_by_uuid(
-        self,
-        *,
-        uid: str,
-        avatar_path: Path,
-        semaphore: asyncio.Semaphore,
-    ) -> bool:
-        """通过 UUID 拉取皮肤并渲染头像。
-
-        流程：
-        1) 调用 skin.mualliance.ltd API 获取皮肤图；
-        2) 使用 PILSkinMC 渲染成玩家立体头像；
-        3) 缩放到 SKIN_SIZE 并缓存为 PNG。
-        """
-        if not self._session:
-            return False
-
-        # Collect compact failure reasons for operation visibility and diagnostics.
-        failed_reasons: list[str] = []
-        for candidate_uuid in self._build_uuid_candidates(uid):
-            url = self.skin_api_url_template.format(uuid=candidate_uuid)
-            for attempt in range(self.avatar_download_retries + 1):
-                should_retry = attempt < self.avatar_download_retries
-                retry_after_seconds: float | None = None
-                try:
-                    async with semaphore:
-                        async with self._session.get(url) as resp:
-                            if resp.status == 200:
-                                raw = await resp.read()
-                                if self._render_avatar_from_skin_bytes(
-                                    skin_bytes=raw,
-                                    avatar_path=avatar_path,
-                                ):
-                                    return True
-                                # 即使状态码 200，内容也可能非有效皮肤；直接放弃该候选 UUID
-                                failed_reasons.append(
-                                    f"{candidate_uuid}:200_invalid_skin"
-                                )
-                                should_retry = False
-                                break
-                            # 404 表示该 UUID 没有皮肤记录，尝试下一个 UUID 候选
-                            if resp.status == 404:
-                                failed_reasons.append(f"{candidate_uuid}:404")
-                                should_retry = False
-                                break
-                            if resp.status == 429:
-                                failed_reasons.append(f"{candidate_uuid}:429")
-                                retry_after_seconds = self._parse_retry_after_seconds(
-                                    resp.headers.get("Retry-After")
-                                )
-                            # 4xx(除 429)通常不适合重试
-                            elif resp.status < 500:
-                                failed_reasons.append(f"{candidate_uuid}:{resp.status}")
-                                should_retry = False
-                                break
-                            else:
-                                failed_reasons.append(f"{candidate_uuid}:{resp.status}")
-                except Exception as exc:
-                    failed_reasons.append(f"{candidate_uuid}:exc:{type(exc).__name__}")
-
-                if should_retry:
-                    # Respect Retry-After on 429 when available; otherwise use short backoff.
-                    await asyncio.sleep(
-                        retry_after_seconds
-                        if retry_after_seconds is not None
-                        else 0.2 * (attempt + 1)
-                    )
-                else:
-                    break
-
-        logger.warning(
-            "avatar download/render failed for uid=%s, reasons=%s",
-            uid,
-            "; ".join(failed_reasons[:6]) if failed_reasons else "unknown",
-        )
-        return False
-
-    @staticmethod
-    def _parse_retry_after_seconds(retry_after: str | None) -> float | None:
-        """解析 Retry-After 头，返回秒数。"""
-        if not retry_after:
-            return None
-        raw = retry_after.strip()
-        try:
-            # 数字秒（最常见）
-            sec = int(raw)
-            return float(max(sec, 0))
-        except ValueError:
-            pass
-        try:
-            # HTTP 日期
-            dt = parsedate_to_datetime(raw)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            delta = (dt - datetime.now(timezone.utc)).total_seconds()
-            return float(max(delta, 0.0))
-        except Exception:
-            return None
-
-    def _render_avatar_from_skin_bytes(
-        self,
-        *,
-        skin_bytes: bytes,
-        avatar_path: Path,
-    ) -> bool:
-        """将皮肤图渲染为头像并保存。
-
-        渲染策略：
-        1) 优先尝试 PILSkinMC 的对象式 API（兼容部分版本）；
-        2) 若对象式 API 不可用，则回退为标准皮肤头部裁剪（含帽子层）；
-        3) 若 PILSkinMC 缺失，不影响回退逻辑，仍可生成头像。
-        """
-        try:
-            with Image.open(io.BytesIO(skin_bytes)) as skin_raw:
-                skin = skin_raw.convert("RGBA")
-                avatar = self._render_avatar_by_pilskinmc_object_api(skin_bytes)
-                if avatar is None:
-                    avatar = self._render_avatar_head_fallback(skin)
-                # 头像使用最近邻放大，保留像素边缘清晰度。
-                avatar = avatar.resize((SKIN_SIZE, SKIN_SIZE), Image.Resampling.NEAREST)
-                avatar_path.parent.mkdir(parents=True, exist_ok=True)
-                avatar.save(avatar_path, format="PNG")
-            return True
-        except Exception as exc:
-            logger.debug("render avatar from skin failed: %s", exc)
-            return False
-
-    def _render_avatar_by_pilskinmc_object_api(self, skin_bytes: bytes) -> Image.Image | None:
-        """委托到 avatar 模块。"""
-        return _avatar_mod._render_avatar_by_pilskinmc_object_api(skin_bytes)
-
-    def _render_avatar_head_fallback(self, skin: Image.Image) -> Image.Image:
-        """委托到 avatar 模块。"""
-        return _avatar_mod._render_avatar_head_fallback(skin)
-
-    @staticmethod
-    def _build_uuid_candidates(uid: str) -> list[str]:
-        """构造 UUID 候选格式（兼容带/不带连字符）。"""
-        raw = (uid or "").strip().lower()
-        if not raw:
-            return []
-        candidates: list[str] = []
-        if raw not in candidates:
-            candidates.append(raw)
-
-        no_dash = raw.replace("-", "")
-        if len(no_dash) == 32:
-            if no_dash not in candidates:
-                candidates.append(no_dash)
-            hyphen = (
-                f"{no_dash[0:8]}-{no_dash[8:12]}-"
-                f"{no_dash[12:16]}-{no_dash[16:20]}-{no_dash[20:32]}"
-            )
-            if hyphen not in candidates:
-                candidates.append(hyphen)
-        return candidates
