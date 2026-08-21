@@ -26,8 +26,8 @@ TIME_TICK_FONT_SIZE = 12
 
 # A graphite dashboard palette with teal, amber, and red status accents.
 BG = (14, 18, 23)
-PANEL = (211, 219, 230)
-PANEL_ALT = (211, 219, 230)
+PANEL = (27, 34, 41)
+PANEL_ALT = (22, 29, 35)
 PANEL_EDGE = (57, 72, 84)
 PANEL_ALPHA = 188
 PANEL_ALT_ALPHA = 172
