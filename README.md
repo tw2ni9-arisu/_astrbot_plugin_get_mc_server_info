@@ -202,4 +202,4 @@ pip install -r requirements.txt
 
 ## License
 
-MIT License
+AGPL3.0 License
