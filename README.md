@@ -184,12 +184,6 @@ Pillow>=10.0.0
 PILSkinMC>=1.0.2
 ```
 
-安装：
-
-```bash
-pip install -r requirements.txt
-```
-
 ## 模型兼容性
 
 模型支持 Function Calling 时，开启 AstrBot Tool 后即可自动调用插件。模型不支持时，传统命令仍然可用，不需要额外配置。
