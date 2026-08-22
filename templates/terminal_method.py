@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 from datetime import datetime
@@ -9,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-
 
 WIDTH = 1100
 PADDING = 28
@@ -20,6 +20,7 @@ CHART_H = 300
 PLAYER_PANEL_W = 350
 PLAYER_ROW_H = 42
 PLAYER_AVATAR_SIZE = 32
+MAX_RENDERED_PLAYERS = 50
 CHART_GRID_COUNT = 5
 HOUR_SECONDS = 60 * 60
 TIME_TICK_FONT_SIZE = 12
@@ -429,7 +430,12 @@ def _draw_panel(
     draw.rounded_rectangle(rect, radius=radius, fill=fill, outline=PANEL_EDGE, width=1)
 
 
-async def render_server_report_image(
+async def render_server_report_image(**kwargs: Any) -> str:
+    """Offload Pillow rendering so it cannot block AstrBot's event loop."""
+    return await asyncio.to_thread(_render_server_report_image_sync, **kwargs)
+
+
+def _render_server_report_image_sync(
     *,
     server_name: str,
     server_address: str,
@@ -444,6 +450,7 @@ async def render_server_report_image(
     history_title: str = "历史延迟",
     offline: bool = False,
 ) -> str:
+    players = players[:MAX_RENDERED_PLAYERS]
     player_panel_h = max(CHART_H, 88 + len(players) * PLAYER_ROW_H)
     total_h = PADDING + HEADER_H + GAP + MOTD_H + GAP + player_panel_h + PADDING
     background = _load_template_background(WIDTH, total_h)

@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 
 DEFAULT_PORT = 25565
 DEFAULT_TEMPLATE_NAME = "default_method"
+MAX_SERVER_ADDRESS_LENGTH = 512
+MAX_SERVER_NAME_LENGTH = 64
 
 
 class InvalidServerAddressError(ValueError):
@@ -30,9 +32,30 @@ def get_or_create_session(store: dict[str, Any], session_key: str) -> dict[str, 
     if not isinstance(session_obj, dict):
         session_obj = {}
         sessions[session_key] = session_obj
-    if not isinstance(session_obj.get("servers"), dict):
-        session_obj["servers"] = {}
-    session_obj.setdefault("template", DEFAULT_TEMPLATE_NAME)
+    raw_servers = session_obj.get("servers")
+    if not isinstance(raw_servers, dict):
+        raw_servers = {}
+    servers: dict[str, dict[str, Any]] = {}
+    for address, server_obj in raw_servers.items():
+        if not isinstance(address, str) or not isinstance(server_obj, dict):
+            continue
+        normalized = dict(server_obj)
+        normalized["name"] = str(server_obj.get("name", address) or address)
+        normalized["address"] = address
+        history = server_obj.get("latency_history", [])
+        normalized["latency_history"] = (
+            [point for point in history if isinstance(point, dict)]
+            if isinstance(history, list)
+            else []
+        )
+        servers[address] = normalized
+    session_obj["servers"] = servers
+
+    template = session_obj.get("template")
+    if not isinstance(template, str) or not template.strip().isidentifier():
+        session_obj["template"] = DEFAULT_TEMPLATE_NAME
+    else:
+        session_obj["template"] = template.strip()
     return session_obj
 
 
@@ -59,7 +82,7 @@ def resolve_unique_server_name(
     exclude_address: str | None = None,
 ) -> tuple[str, bool]:
     """会话内服务器名称去重，必要时自动追加序号后缀。"""
-    base = desired_name.strip()
+    base = desired_name.strip()[:MAX_SERVER_NAME_LENGTH]
     if not base:
         base = "未命名服务器"
     existing_names: set[str] = set()
@@ -73,7 +96,8 @@ def resolve_unique_server_name(
         return base, False
     index = 1
     while True:
-        candidate = f"{base}({index})"
+        suffix = f"({index})"
+        candidate = f"{base[: MAX_SERVER_NAME_LENGTH - len(suffix)]}{suffix}"
         if candidate not in existing_names:
             return candidate, True
         index += 1
@@ -84,12 +108,35 @@ def append_latency(
     latency: int,
     now_ts: int,
     history_limit: int,
+    *,
+    bucket_seconds: int = 1,
 ) -> None:
-    """追加延迟历史并裁剪到固定长度。"""
-    history = server_obj.setdefault("latency_history", [])
-    history.append({"timestamp": now_ts, "latency": int(latency)})
-    if len(history) > history_limit:
-        server_obj["latency_history"] = history[-history_limit:]
+    """Append one latency sample per time bucket and retain a bounded history."""
+    raw_history = server_obj.get("latency_history", [])
+    history = (
+        [point for point in raw_history if isinstance(point, dict)]
+        if isinstance(raw_history, list)
+        else []
+    )
+    interval = max(int(bucket_seconds), 1)
+    timestamp = int(now_ts)
+    current_bucket = timestamp // interval
+    history = [
+        point
+        for point in history
+        if _history_point_bucket(point, interval) != current_bucket
+    ]
+    history.append({"timestamp": timestamp, "latency": int(latency)})
+    limit = max(int(history_limit), 1)
+    server_obj["latency_history"] = history[-limit:]
+
+
+def _history_point_bucket(point: dict[str, Any], interval: int) -> int | None:
+    try:
+        timestamp = int(point.get("timestamp", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return timestamp // interval if timestamp > 0 else None
 
 
 def normalize_address(
@@ -146,7 +193,11 @@ def parse_server_address(
 ) -> tuple[str, int]:
     """Parse and validate the host/port syntax used by mcstatus."""
     raw = (address or "").strip()
-    if not raw or any(char.isspace() or ord(char) < 32 for char in raw):
+    if (
+        not raw
+        or len(raw) > MAX_SERVER_ADDRESS_LENGTH
+        or any(char.isspace() or ord(char) < 32 for char in raw)
+    ):
         raise InvalidServerAddressError("server address is invalid")
 
     try:
@@ -154,7 +205,7 @@ def parse_server_address(
     except ValueError:
         literal_ip = None
     if literal_ip is not None:
-        if not 0 <= default_port <= 65535:
+        if not 1 <= default_port <= 65535:
             raise InvalidServerAddressError("server address port is invalid")
         return str(literal_ip), default_port
 
@@ -178,7 +229,7 @@ def parse_server_address(
 
     if port is None:
         port = default_port
-    if not 0 <= port <= 65535:
+    if not 1 <= port <= 65535:
         raise InvalidServerAddressError("server address port is invalid")
     return host, port
 

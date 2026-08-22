@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import inspect
 import io
+import tempfile
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -26,6 +27,9 @@ except Exception:
     _PILSKINMC = None
 
 SKIN_SIZE = 32
+MAX_SKIN_BYTES = 2 * 1024 * 1024
+MAX_SKIN_DIMENSION = 1_024
+MAX_SKIN_PIXELS = 1_024 * 1_024
 MAX_RETRY_AFTER_SECONDS = 30.0
 
 
@@ -51,7 +55,11 @@ async def download_and_render_avatar_by_uuid(
     # Collect compact failure reasons for operation visibility and diagnostics.
     failed_reasons: list[str] = []
     for candidate_uuid in build_uuid_candidates(uid):
-        url = skin_api_url_template.format(uuid=candidate_uuid)
+        try:
+            url = skin_api_url_template.format(uuid=candidate_uuid)
+        except (KeyError, ValueError):
+            failed_reasons.append(f"{candidate_uuid}:invalid_url_template")
+            break
         for attempt in range(avatar_download_retries + 1):
             should_retry = attempt < avatar_download_retries
             retry_after_seconds: float | None = None
@@ -59,8 +67,30 @@ async def download_and_render_avatar_by_uuid(
                 async with semaphore:
                     async with session.get(url) as resp:
                         if resp.status == 200:
-                            raw = await resp.read()
-                            if render_avatar_from_skin_bytes(
+                            content_length = _parse_content_length(
+                                resp.headers.get("Content-Length")
+                            )
+                            if (
+                                content_length is not None
+                                and content_length > MAX_SKIN_BYTES
+                            ):
+                                failed_reasons.append(
+                                    f"{candidate_uuid}:200_skin_too_large"
+                                )
+                                should_retry = False
+                                break
+                            try:
+                                raw = await resp.content.readexactly(MAX_SKIN_BYTES + 1)
+                            except asyncio.IncompleteReadError as exc:
+                                raw = exc.partial
+                            if len(raw) > MAX_SKIN_BYTES:
+                                failed_reasons.append(
+                                    f"{candidate_uuid}:200_skin_too_large"
+                                )
+                                should_retry = False
+                                break
+                            if await asyncio.to_thread(
+                                render_avatar_from_skin_bytes,
                                 skin_bytes=raw,
                                 avatar_path=avatar_path,
                             ):
@@ -107,6 +137,16 @@ async def download_and_render_avatar_by_uuid(
     return False
 
 
+def _parse_content_length(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        length = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(length, 0)
+
+
 def render_avatar_from_skin_bytes(
     *,
     skin_bytes: bytes,
@@ -119,8 +159,19 @@ def render_avatar_from_skin_bytes(
     2) 若对象式 API 不可用，则回退为标准皮肤头部裁剪（含帽子层）；
     3) 若 PILSkinMC 缺失，不影响回退逻辑，仍可生成头像。
     """
+    temp_path: Path | None = None
     try:
         with Image.open(io.BytesIO(skin_bytes)) as skin_raw:
+            width, height = skin_raw.size
+            if (
+                width < 16
+                or height < 16
+                or width > MAX_SKIN_DIMENSION
+                or height > MAX_SKIN_DIMENSION
+                or width * height > MAX_SKIN_PIXELS
+            ):
+                return False
+            skin_raw.load()
             skin = skin_raw.convert("RGBA")
             avatar = _render_avatar_by_pilskinmc_object_api(skin_bytes)
             if avatar is None:
@@ -128,11 +179,23 @@ def render_avatar_from_skin_bytes(
             # 头像使用最近邻放大，保留像素边缘清晰度。
             avatar = avatar.resize((SKIN_SIZE, SKIN_SIZE), Image.Resampling.NEAREST)
             avatar_path.parent.mkdir(parents=True, exist_ok=True)
-            avatar.save(avatar_path, format="PNG")
+            with tempfile.NamedTemporaryFile(
+                dir=avatar_path.parent,
+                prefix=f".{avatar_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+            avatar.save(temp_path, format="PNG")
+            temp_path.replace(avatar_path)
         return True
     except Exception as exc:
         logger.debug("render avatar from skin failed: %s", exc)
         return False
+    finally:
+        if temp_path is not None:
+            with contextlib.suppress(OSError):
+                temp_path.unlink(missing_ok=True)
 
 
 def _render_avatar_by_pilskinmc_object_api(

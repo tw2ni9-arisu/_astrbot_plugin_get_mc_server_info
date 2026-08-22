@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -19,6 +20,14 @@ from . import cache as _cache_mod
 from . import store as _store_mod
 
 MOTD_FORMAT_CODE_PATTERN = re.compile(r"§.")
+MAX_PLAYER_SAMPLES = 50
+MAX_PLAYER_NAME_LENGTH = 64
+MAX_VERSION_LENGTH = 128
+MAX_LATENCY_MS = 60_000
+MAX_PLAYER_COUNT = 10_000_000
+MAX_FAVICON_TEXT_LENGTH = 400_000
+MAX_MOTD_NODES = 1_024
+MAX_MOTD_FLATTENED_LENGTH = 4_096
 
 
 class McServerConnectionError(RuntimeError):
@@ -87,7 +96,32 @@ async def fetch_server_status(
     need_players: bool,
     status_timeout: int,
 ) -> ServerStatus:
-    """请求并标准化服务器状态。"""
+    """Fetch and normalize status within one end-to-end timeout budget."""
+    timeout = max(float(status_timeout), 0.001)
+    try:
+        return await asyncio.wait_for(
+            _fetch_server_status_once(
+                address,
+                need_players=need_players,
+                status_timeout=timeout,
+            ),
+            timeout=timeout,
+        )
+    except McServerInvalidAddressError:
+        raise
+    except McServerTimeoutError:
+        raise
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        raise McServerTimeoutError("server query timed out") from exc
+
+
+async def _fetch_server_status_once(
+    address: str,
+    *,
+    need_players: bool,
+    status_timeout: float,
+) -> ServerStatus:
+    """Perform one server query; the caller owns the total timeout."""
     try:
         server = await lookup_public_server(address)
     except McServerInvalidAddressError:
@@ -110,43 +144,74 @@ async def fetch_server_status(
 
     icon_base64 = None
     if getattr(status, "favicon", None):
-        icon_base64 = str(status.favicon)
+        candidate_icon = str(status.favicon)
+        if len(candidate_icon) <= MAX_FAVICON_TEXT_LENGTH:
+            icon_base64 = candidate_icon
 
     players: list[dict[str, str]] = []
+    player_status = getattr(status, "players", None)
     if need_players:
-        sample_players = getattr(status.players, "sample", None) or []
-        for player in sample_players:
-            player_name = getattr(player, "name", "") or ""
-            player_uid = getattr(player, "id", "") or ""
+        sample_players = getattr(player_status, "sample", None) or []
+        if not isinstance(sample_players, (list, tuple)):
+            sample_players = []
+        for player in sample_players[:MAX_PLAYER_SAMPLES]:
+            player_name = str(getattr(player, "name", "") or "")[
+                :MAX_PLAYER_NAME_LENGTH
+            ]
+            player_uid = str(getattr(player, "id", "") or "")[:64]
             if not player_name:
                 continue
             player_uid = _cache_mod.normalize_player_uid(player_uid, player_name)
             players.append({"name": player_name, "uid": player_uid})
 
-    latency = int(round(getattr(status, "latency", 0) or 0))
+    latency = _safe_nonnegative_int(
+        getattr(status, "latency", 0),
+        max_value=MAX_LATENCY_MS,
+    )
     # async_ping() 测量轻量协议往返，比 async_status() 更接近游戏内显示
     try:
         ping_latency = await asyncio.wait_for(
             server.async_ping(), timeout=min(5, status_timeout)
         )
-        if ping_latency > 0:
-            latency = int(round(ping_latency))
+        ping_value = _safe_nonnegative_int(
+            ping_latency,
+            max_value=MAX_LATENCY_MS,
+        )
+        if ping_value > 0:
+            latency = ping_value
     except Exception:
         pass
-    version = (
-        getattr(status.version, "name", "Unknown") if status.version else "Unknown"
-    )
+    version_status = getattr(status, "version", None)
+    version = str(
+        getattr(version_status, "name", "Unknown") if version_status else "Unknown"
+    )[:MAX_VERSION_LENGTH]
     motd = extract_motd_text(getattr(status, "description", None))
     return ServerStatus(
         address=address,
         latency=max(latency, 0),
         version=version,
-        players_online=int(getattr(status.players, "online", 0) or 0),
-        players_max=int(getattr(status.players, "max", 0) or 0),
+        players_online=_safe_nonnegative_int(
+            getattr(player_status, "online", 0),
+            max_value=MAX_PLAYER_COUNT,
+        ),
+        players_max=_safe_nonnegative_int(
+            getattr(player_status, "max", 0),
+            max_value=MAX_PLAYER_COUNT,
+        ),
         icon_base64=icon_base64,
         players=players,
         motd=motd,
     )
+
+
+def _safe_nonnegative_int(value: Any, *, max_value: int) -> int:
+    try:
+        numeric = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not math.isfinite(numeric):
+        return 0
+    return min(max(int(round(numeric)), 0), max_value)
 
 
 # ---- Motd 提取 ----
@@ -159,7 +224,9 @@ def extract_motd_text(description: Any) -> str:
     try:
         to_plain = getattr(description, "to_plain", None)
         if callable(to_plain):
-            text = strip_minecraft_format_codes(str(to_plain() or "")).strip()
+            text = strip_minecraft_format_codes(
+                str(to_plain() or "")[:MAX_MOTD_FLATTENED_LENGTH]
+            ).strip()
             if text:
                 return text[:300]
     except Exception:
@@ -177,23 +244,47 @@ def strip_minecraft_format_codes(text: str) -> str:
 
 
 def flatten_motd_node(node: Any) -> str:
-    """递归展平 Motd 节点为纯文本。"""
-    if node is None:
-        return ""
-    if isinstance(node, str):
-        return node
-    if isinstance(node, dict):
-        parts: list[str] = []
-        if "text" in node:
-            parts.append(flatten_motd_node(node.get("text")))
-        if "extra" in node:
-            parts.append(flatten_motd_node(node.get("extra")))
-        if "translate" in node and not parts:
-            parts.append(flatten_motd_node(node.get("translate")))
-        return "".join(parts)
-    if isinstance(node, (list, tuple)):
-        return "".join(flatten_motd_node(item) for item in node)
-    return str(node)
+    """Flatten an untrusted MOTD tree within fixed work and output budgets."""
+    stack: list[Any] = [node]
+    parts: list[str] = []
+    output_length = 0
+    visited_nodes = 0
+
+    while stack and visited_nodes < MAX_MOTD_NODES:
+        current = stack.pop()
+        visited_nodes += 1
+        if current is None:
+            continue
+        if isinstance(current, str):
+            text = current
+        elif isinstance(current, dict):
+            children: list[Any] = []
+            if "text" in current:
+                children.append(current.get("text"))
+            if "extra" in current:
+                children.append(current.get("extra"))
+            if "translate" in current and not children:
+                children.append(current.get("translate"))
+            stack.extend(reversed(children))
+            continue
+        elif isinstance(current, (list, tuple)):
+            remaining_nodes = MAX_MOTD_NODES - visited_nodes
+            stack.extend(reversed(current[:remaining_nodes]))
+            continue
+        else:
+            try:
+                text = str(current)
+            except Exception:
+                continue
+
+        remaining_chars = MAX_MOTD_FLATTENED_LENGTH - output_length
+        if remaining_chars <= 0:
+            break
+        fragment = text[:remaining_chars]
+        parts.append(fragment)
+        output_length += len(fragment)
+
+    return "".join(parts)
 
 
 # ---- 延迟历史构建 ----
@@ -228,19 +319,17 @@ def build_render_history(
 
         normalized_points.append((ts, max(latency, 0)))
 
-    normalized_points.sort(key=lambda item: item[0])
-    normalized_points = normalized_points[-limit:]
-    previous_slot = -1
-    point_count = len(normalized_points)
-    for index, (ts, latency) in enumerate(normalized_points):
+    slot_points: dict[int, tuple[int, int]] = {}
+    for ts, latency in normalized_points:
         target_slot = int((ts - start_ts + interval // 2) // interval)
         target_slot = max(0, min(target_slot, limit - 1))
-        min_slot = previous_slot + 1
-        max_slot = limit - (point_count - index)
-        slot = min(max(target_slot, min_slot), max_slot)
+        existing = slot_points.get(target_slot)
+        if existing is None or ts >= existing[0]:
+            slot_points[target_slot] = (ts, latency)
+
+    for slot, (ts, latency) in slot_points.items():
         series[slot]["timestamp"] = ts
         series[slot]["latency"] = latency
-        previous_slot = slot
 
     return series
 

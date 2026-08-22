@@ -7,14 +7,20 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import re
 import shutil
+import struct
+import tempfile
 from pathlib import Path
 
 from .store import address_hash
 
 MAX_ICON_BYTES = 256 * 1024
+MAX_ICON_DIMENSION = 1_024
+MAX_ICON_PIXELS = 1_024 * 1_024
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PLAYER_UUID_PATTERN = re.compile(
     r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
@@ -72,12 +78,47 @@ async def cache_server_icon(
     payload = icon_base64
     if "," in payload:
         payload = payload.split(",", 1)[1]
+    payload = "".join(payload.split())
+    max_base64_chars = ((MAX_ICON_BYTES + 2) // 3) * 4 + 4
+    if len(payload) > max_base64_chars:
+        return
     try:
-        raw = base64.b64decode(payload)
+        raw = base64.b64decode(payload, validate=True)
     except Exception:
         return
-    if len(raw) > MAX_ICON_BYTES:
+    if len(raw) > MAX_ICON_BYTES or not _is_safe_png(raw):
         return
-    icon_path = icon_cache_path(cache_root, address)
-    icon_path.parent.mkdir(parents=True, exist_ok=True)
-    icon_path.write_bytes(raw)
+    temp_path: Path | None = None
+    try:
+        icon_path = icon_cache_path(cache_root, address)
+        icon_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=icon_path.parent,
+            prefix=f".{icon_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(raw)
+            temp_path = Path(temp_file.name)
+        temp_path.replace(icon_path)
+    except OSError:
+        return
+    finally:
+        if temp_path is not None:
+            with contextlib.suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+
+
+def _is_safe_png(raw: bytes) -> bool:
+    """Validate the fixed PNG header without decompressing attacker data."""
+    if len(raw) < 33 or not raw.startswith(PNG_SIGNATURE):
+        return False
+    if raw[12:16] != b"IHDR" or raw[8:12] != b"\x00\x00\x00\r":
+        return False
+    width, height = struct.unpack(">II", raw[16:24])
+    return (
+        0 < width <= MAX_ICON_DIMENSION
+        and 0 < height <= MAX_ICON_DIMENSION
+        and width * height <= MAX_ICON_PIXELS
+    )

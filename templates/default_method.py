@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 from datetime import datetime
@@ -18,6 +19,7 @@ MOTD_H = 72
 CHART_H = 232
 PLAYER_ROW_H = 38
 PLAYER_AVATAR_SIZE = 28
+MAX_RENDERED_PLAYERS = 50
 CHART_GRID_COUNT = 5
 HOUR_SECONDS = 60 * 60
 TIME_TICK_FONT_SIZE = 12
@@ -394,7 +396,12 @@ def _paste_avatar(img: Image.Image, avatar_path: str, xy: tuple[int, int]) -> No
     img.paste(fallback, (x, y), fallback)
 
 
-async def render_server_report_image(
+async def render_server_report_image(**kwargs: Any) -> str:
+    """Offload Pillow rendering so it cannot block AstrBot's event loop."""
+    return await asyncio.to_thread(_render_server_report_image_sync, **kwargs)
+
+
+def _render_server_report_image_sync(
     *,
     server_name: str,
     server_address: str,
@@ -409,6 +416,7 @@ async def render_server_report_image(
     history_title: str = "历史延迟",
     offline: bool = False,
 ) -> str:
+    players = players[:MAX_RENDERED_PLAYERS]
     # 1. 动态计算高度
     player_section_h = max(160, 56 + len(players) * PLAYER_ROW_H + 20)
     # 保留底部留白，并为图表的新增坐标刻度预留高度

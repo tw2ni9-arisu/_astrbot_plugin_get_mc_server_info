@@ -2,25 +2,25 @@
   "silent_query_interval_seconds": {
     "type": "int",
     "description": "Interval between background silent polling rounds (seconds).",
-    "hint": "Default 1800 (30 minutes). Minimum 60.",
+    "hint": "Default 1800 (30 minutes). Range 60-604800.",
     "default": 1800
   },
   "history_limit": {
     "type": "int",
     "description": "Max retained latency history points per server.",
-    "hint": "Default 48 (about 24h if poll interval is 30m). Minimum 1.",
+    "hint": "Default 48 (about 24h if poll interval is 30m). Range 1-2048.",
     "default": 48
   },
   "cache_ttl_seconds": {
     "type": "int",
     "description": "TTL for cached icon/avatar files (seconds).",
-    "hint": "Default 86400 (24 hours). Minimum 60.",
+    "hint": "Default 86400 (24 hours). Range 60-2592000.",
     "default": 86400
   },
   "status_timeout_seconds": {
     "type": "int",
     "description": "Timeout for a single MC status request (seconds).",
-    "hint": "Default 10. Minimum 1.",
+    "hint": "Default 10. Range 1-60 and covers lookup, DNS, status, and ping.",
     "default": 10
   },
   "auto_append_default_port": {
@@ -29,34 +29,64 @@
     "hint": "Default false. Applies to '/添加服务器' and '/查询服务器 <服务器地址>'.",
     "default": false
   },
+  "mutation_requires_admin": {
+    "type": "bool",
+    "description": "Require administrator permission for saved-server and template mutations.",
+    "hint": "Default true. Applies to command handlers and LLM tools.",
+    "default": true
+  },
+  "direct_query_requires_admin": {
+    "type": "bool",
+    "description": "Require administrator permission to query an unsaved address directly.",
+    "hint": "Default true. Queries of saved servers remain available to regular members.",
+    "default": true
+  },
   "query_all_concurrency": {
     "type": "int",
     "description": "Max concurrent requests for '/查询服务器' (all servers).",
-    "hint": "Default 5. Minimum 1.",
+    "hint": "Default 5. Range 1-20.",
     "default": 5
+  },
+  "max_servers_per_session": {
+    "type": "int",
+    "description": "Maximum saved servers in one group or private-session scope.",
+    "hint": "Default 50. Range 1-500.",
+    "default": 50
   },
   "avatar_download_concurrency": {
     "type": "int",
     "description": "Max concurrent player skin/avatar downloads.",
-    "hint": "Default 5. Minimum 1.",
+    "hint": "Default 5. Range 1-20.",
     "default": 5
   },
   "avatar_download_retries": {
     "type": "int",
     "description": "Retry count for each avatar download candidate.",
-    "hint": "Default 2 (total attempts = 1 + retries). Minimum 0.",
+    "hint": "Default 2 (total attempts = 1 + retries). Range 0-5.",
     "default": 2
+  },
+  "avatar_batch_timeout_seconds": {
+    "type": "int",
+    "description": "Total timeout for collecting one server's player avatars.",
+    "hint": "Default 30. Range 1-120.",
+    "default": 30
+  },
+  "render_timeout_seconds": {
+    "type": "int",
+    "description": "Total timeout for rendering one server report image.",
+    "hint": "Default 30. Range 1-120.",
+    "default": 30
   },
   "query_result_cache_ttl_seconds": {
     "type": "int",
     "description": "TTL for single-server rendered image cache.",
-    "hint": "Default 10. Repeated single queries within this window return cached image.",
+    "hint": "Default 10. Range 1-300. Repeated single queries within this window return cached image.",
     "default": 10
   },
   "skin_api_url_template": {
     "type": "string",
     "description": "Skin API URL template used to fetch skin by UUID.",
-    "hint": "Must contain '{uuid}' placeholder. Invalid value falls back to default.",
+    "hint": "Must be an HTTP(S) URL containing only the '{uuid}' placeholder. Invalid value falls back to default.",
     "default": "https://skin.mualliance.ltd/api/union/skin/byuuid/{uuid}"
   }
 }

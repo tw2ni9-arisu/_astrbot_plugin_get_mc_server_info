@@ -22,7 +22,9 @@ import uuid
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
+from string import Formatter
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -59,6 +61,9 @@ COMMAND_FALLBACK_PATTERN = re.compile(
 
 # 是否自动补全默认端口（可被插件配置覆盖）
 AUTO_APPEND_DEFAULT_PORT = False
+# 写操作和未保存地址直连默认仅允许管理员
+MUTATION_REQUIRES_ADMIN = True
+DIRECT_QUERY_REQUIRES_ADMIN = True
 # 静默轮询间隔：30 分钟
 SILENT_QUERY_INTERVAL_SECONDS = 30 * 60
 # 仅保留最近 48 个延迟点（刚好对应 24 小时，30 分钟/点）
@@ -73,10 +78,15 @@ DEFAULT_TEMPLATE_NAME = "default_method"
 DEFAULT_OFFLINE_MOTD = "邦邦咔邦"
 # 全服主动查询并发上限
 QUERY_ALL_CONCURRENCY = 5
+# 单会话最多保存服务器数
+MAX_SERVERS_PER_SESSION = 50
 # 头像下载并发上限
 AVATAR_DOWNLOAD_CONCURRENCY = 5
 # 头像下载重试次数（总尝试次数 = 1 + retries）
 AVATAR_DOWNLOAD_RETRIES = 2
+# 头像批处理与图片渲染的端到端超时
+AVATAR_BATCH_TIMEOUT_SECONDS = 30
+RENDER_TIMEOUT_SECONDS = 30
 # 皮肤接口（按 UUID 获取玩家皮肤）
 SKIN_API_URL_TEMPLATE = "https://skin.mualliance.ltd/api/union/skin/byuuid/{uuid}"
 # 单服查询结果渲染缓存时长（秒）
@@ -85,7 +95,7 @@ QUERY_RESULT_CACHE_TTL_SECONDS = 10
 QUERY_CACHE_CLEANUP_INTERVAL_SECONDS = 5 * 60
 # LLM Tool 返回结构版本
 TOOL_VERSION = "1.2"
-PLUGIN_VERSION = "v1.9.1"
+PLUGIN_VERSION = "v1.9.2"
 # Tool 查询状态缓存，避免 Agent 连续追问时重复打到 MC 服务端
 TOOL_STATUS_CACHE_TTL_SECONDS = 30
 # Tool 列表缓存，避免 Agent 连续追问列表细节时重复读取存储
@@ -159,10 +169,15 @@ class Main(Star):
         self.cache_ttl_seconds = CACHE_TTL_SECONDS
         self.status_timeout_seconds = STATUS_TIMEOUT
         self.query_all_concurrency = QUERY_ALL_CONCURRENCY
+        self.max_servers_per_session = MAX_SERVERS_PER_SESSION
         self.avatar_download_concurrency = AVATAR_DOWNLOAD_CONCURRENCY
         self.avatar_download_retries = AVATAR_DOWNLOAD_RETRIES
+        self.avatar_batch_timeout_seconds = AVATAR_BATCH_TIMEOUT_SECONDS
+        self.render_timeout_seconds = RENDER_TIMEOUT_SECONDS
         self.skin_api_url_template = SKIN_API_URL_TEMPLATE
         self.auto_append_default_port = AUTO_APPEND_DEFAULT_PORT
+        self.mutation_requires_admin = MUTATION_REQUIRES_ADMIN
+        self.direct_query_requires_admin = DIRECT_QUERY_REQUIRES_ADMIN
         self.query_result_cache_ttl_seconds = QUERY_RESULT_CACHE_TTL_SECONDS
         self._query_render_cache: dict[
             tuple[str, str, str, str], QueryRenderCacheEntry
@@ -170,6 +185,7 @@ class Main(Star):
         self._tool_status_cache: dict[str, ToolStatusCacheEntry] = {}
         self._tool_list_cache: dict[str, ToolListCacheEntry] = {}
         self._tool_rate_limit_hits: dict[str, list[float]] = {}
+        self._command_rate_limit_hits: dict[str, list[float]] = {}
         self._tool_query_semaphore = asyncio.Semaphore(TOOL_QUERY_CONCURRENCY)
         self._avatar_file_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
@@ -218,6 +234,7 @@ class Main(Star):
         self._tool_status_cache.clear()
         self._tool_list_cache.clear()
         self._tool_rate_limit_hits.clear()
+        self._command_rate_limit_hits.clear()
         self._avatar_file_locks.clear()
         logger.info("astrbot_plugin_get_mc_server_info terminated.")
 
@@ -225,6 +242,12 @@ class Main(Star):
     async def add_server(self, event: AstrMessageEvent):
         """添加 MC 服务器：/添加服务器 <服务器名称> <服务器地址>；或 /添加 <服务器名称> <服务器地址>"""
         if self._should_ignore_self_event(event):
+            return
+        if self._is_mutation_denied(event):
+            yield event.plain_result("权限不足：该操作仅限管理员")
+            return
+        if self._check_command_rate_limit(event):
+            yield event.plain_result("请求过于频繁，请稍后再试")
             return
 
         # 1) 解析与格式校验
@@ -251,6 +274,11 @@ class Main(Star):
         if result.get("error") == "SERVER_ALREADY_EXISTS":
             yield event.plain_result("添加失败！该服务器已存在")
             return
+        if result.get("error") == "SERVER_LIMIT_REACHED":
+            yield event.plain_result(
+                f"添加失败！当前会话最多保存 {result.get('limit', self.max_servers_per_session)} 个服务器"
+            )
+            return
         if result.get("error") == "SAVE_FAILED":
             yield event.plain_result("添加失败！服务器保存失败，请稍后重试")
             return
@@ -271,6 +299,9 @@ class Main(Star):
     async def query_server(self, event: AstrMessageEvent):
         """查询 MC 服务器：/查询服务器 [服务器名称|服务器地址]；或 /查询 [服务器名称|服务器地址]"""
         if self._should_ignore_self_event(event):
+            return
+        if self._check_command_rate_limit(event):
+            yield event.plain_result("请求过于频繁，请稍后再试")
             return
 
         # 无参数 => 查询当前会话全部服务器
@@ -303,6 +334,11 @@ class Main(Star):
                 yield await self._query_single_server(event, matched_addresses[0])
                 return
 
+            normalized_query = self._normalize_address(query_token)
+            if normalized_query in servers:
+                yield await self._query_single_server(event, normalized_query)
+                return
+
             # 未命中已添加的服务器名称时，尝试按地址直连查询；
             # 若输入看起来是名称而非地址，则直接反馈不存在。
             if "." not in query_token and ":" not in query_token:
@@ -311,9 +347,13 @@ class Main(Star):
                 )
                 return
 
+            if self.direct_query_requires_admin and not self._is_admin_event(event):
+                yield event.plain_result("权限不足：直连未保存地址仅限管理员")
+                return
+
             yield await self._query_direct_address(
                 event,
-                self._normalize_address(query_token),
+                normalized_query,
             )
             return
 
@@ -346,6 +386,13 @@ class Main(Star):
             yield event.plain_result(output)
             return
 
+        if self._is_mutation_denied(event):
+            yield event.plain_result("权限不足：该操作仅限管理员")
+            return
+        if self._check_command_rate_limit(event):
+            yield event.plain_result("请求过于频繁，请稍后再试")
+            return
+
         if (
             template_name == "reload"
             and not self._template_file_path(template_name).is_file()
@@ -371,6 +418,9 @@ class Main(Star):
         """Reload template and rendered-image caches."""
         if self._should_ignore_self_event(event):
             return
+        if self._is_mutation_denied(event):
+            yield event.plain_result("权限不足：该操作仅限管理员")
+            return
 
         self._reload_template_caches()
         yield event.plain_result("模板缓存已重载")
@@ -379,6 +429,9 @@ class Main(Star):
     async def rename_server(self, event: AstrMessageEvent):
         """重命名当前会话中的服务器：/重命名服务器 <旧名称> <新名称>；或 /重命名 <旧名称> <新名称>"""
         if self._should_ignore_self_event(event):
+            return
+        if self._is_mutation_denied(event):
+            yield event.plain_result("权限不足：该操作仅限管理员")
             return
 
         matched = RENAME_SERVER_PATTERN.match(event.message_str.strip())
@@ -428,6 +481,9 @@ class Main(Star):
     async def delete_server(self, event: AstrMessageEvent):
         """删除当前会话中的服务器：/删除服务器 <服务器名称>；或 /删除 <服务器名称>"""
         if self._should_ignore_self_event(event):
+            return
+        if self._is_mutation_denied(event):
+            yield event.plain_result("权限不足：该操作仅限管理员")
             return
 
         matched = DELETE_SERVER_PATTERN.match(event.message_str.strip())
@@ -528,6 +584,12 @@ class Main(Star):
         """重定向 MC 服务器地址：/重定向 <服务器名称> <新地址>"""
         if self._should_ignore_self_event(event):
             return
+        if self._is_mutation_denied(event):
+            yield event.plain_result("权限不足：该操作仅限管理员")
+            return
+        if self._check_command_rate_limit(event):
+            yield event.plain_result("请求过于频繁，请稍后再试")
+            return
         matched = REDIRECT_SERVER_PATTERN.match(event.message_str.strip())
         if not matched:
             yield event.plain_result(self._build_help_message())
@@ -586,12 +648,22 @@ class Main(Star):
         if rate_limited:
             return rate_limited
         try:
-            cache_key = self._build_tool_status_cache_key(session_key, server)
+            allow_direct = not self.direct_query_requires_admin or self._is_admin_event(
+                event
+            )
+            cache_key = (
+                self._build_tool_status_cache_key(session_key, server)
+                + f"|direct={int(allow_direct)}"
+            )
             cached = self._try_get_tool_status_cache(cache_key)
             if cached is not None:
                 return self._with_tool_meta(cached | {"cached": True})
             async with self._tool_query_semaphore:
-                result = await self._query_server_data(session_key, server)
+                result = await self._query_server_data(
+                    session_key,
+                    server,
+                    allow_direct=allow_direct,
+                )
             if result.get("ok"):
                 self._set_tool_status_cache(cache_key, result)
             return self._with_tool_meta(result | {"cached": False})
@@ -649,6 +721,8 @@ class Main(Star):
         不要用于查询服务器状态、Minecraft 客户端安装、Java 环境、
         Mod、插件配置或游戏攻略问题。
         """
+        if self._is_mutation_denied(event):
+            return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
             return rate_limited
@@ -678,6 +752,8 @@ class Main(Star):
         不要用于查询服务器状态、卸载 Minecraft 客户端、删除 Mod、
         删除 AstrBot 插件或游戏存档管理。
         """
+        if self._is_mutation_denied(event):
+            return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
             return rate_limited
@@ -709,6 +785,8 @@ class Main(Star):
         不要用于修改 Minecraft 用户名、服务器地址、Mod 名称、
         插件名称或非本插件保存的服务器名称。
         """
+        if self._is_mutation_denied(event):
+            return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
             return rate_limited
@@ -781,6 +859,8 @@ class Main(Star):
         不要用于切换 Minecraft 客户端版本、Java 版本、材质包、
         光影包、Mod 或服务器自身插件。
         """
+        if self._is_mutation_denied(event):
+            return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
             return rate_limited
@@ -840,6 +920,8 @@ class Main(Star):
             new_address(string): 新的服务器地址
         """
         session_key = event.unified_msg_origin
+        if self._is_mutation_denied(event):
+            return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
             return rate_limited
@@ -870,6 +952,21 @@ class Main(Star):
         hits.append(now)
         return None
 
+    def _check_command_rate_limit(self, event: AstrMessageEvent) -> bool:
+        actor_key = self._build_tool_actor_key(event)
+        now = time.monotonic()
+        window_start = now - TOOL_RATE_LIMIT_WINDOW_SECONDS
+        hits = [
+            hit
+            for hit in self._command_rate_limit_hits.get(actor_key, [])
+            if hit >= window_start
+        ]
+        self._command_rate_limit_hits[actor_key] = hits
+        if len(hits) >= TOOL_RATE_LIMIT_MAX_CALLS:
+            return True
+        hits.append(now)
+        return False
+
     def _build_tool_actor_key(self, event: AstrMessageEvent) -> str:
         sender_id = self._get_event_sender_id(event)
         if not sender_id:
@@ -891,7 +988,7 @@ class Main(Star):
         return f"{session_key}|{self._normalize_tool_server_token(server)}"
 
     def _normalize_tool_server_token(self, server: str) -> str:
-        token = (server or "").strip().lower().rstrip(":")
+        token = (server or "").strip()
         if not token:
             return token
         return self._normalize_address(token)
@@ -958,6 +1055,13 @@ class Main(Star):
                 self._tool_rate_limit_hits[actor_key] = active_hits
             else:
                 self._tool_rate_limit_hits.pop(actor_key, None)
+        for actor_key, hits in list(self._command_rate_limit_hits.items()):
+            active_hits = [hit for hit in hits if hit >= window_start]
+            removed += len(hits) - len(active_hits)
+            if active_hits:
+                self._command_rate_limit_hits[actor_key] = active_hits
+            else:
+                self._command_rate_limit_hits.pop(actor_key, None)
         return removed
 
     @staticmethod
@@ -1001,7 +1105,22 @@ class Main(Star):
             }
         )
 
-    async def _query_server_data(self, session_key: str, server: str) -> dict[str, Any]:
+    def _tool_permission_denied(self) -> dict[str, Any]:
+        return self._with_tool_meta(
+            {
+                "ok": False,
+                "error": "PERMISSION_DENIED",
+                "message": "administrator permission is required",
+            }
+        )
+
+    async def _query_server_data(
+        self,
+        session_key: str,
+        server: str,
+        *,
+        allow_direct: bool = True,
+    ) -> dict[str, Any]:
         """Query server data for LLM tools without rendering images."""
         query_token = (server or "").strip()
         if not query_token:
@@ -1027,10 +1146,22 @@ class Main(Star):
                 "message": "multiple saved servers use this name; query by address",
             }
 
-        managed = len(matched_addresses) == 1
-        address = (
-            matched_addresses[0] if managed else self._normalize_address(query_token)
-        )
+        if matched_addresses:
+            address = matched_addresses[0]
+            managed = True
+        else:
+            address = self._normalize_address(query_token)
+            managed = address in servers
+        if not managed and not allow_direct:
+            return {
+                "ok": False,
+                "online": False,
+                "server": query_token,
+                "address": address,
+                "managed": False,
+                "error": "PERMISSION_DENIED",
+                "message": "administrator permission is required for direct queries",
+            }
         saved_server = servers.get(address, {})
         display_name = str(
             saved_server.get("name", query_token if managed else address)
@@ -1179,6 +1310,12 @@ class Main(Star):
                 "error": "INVALID_ARGUMENT",
                 "message": "name and address are required",
             }
+        if len(desired_name) > _store_mod.MAX_SERVER_NAME_LENGTH:
+            return {
+                "ok": False,
+                "error": "INVALID_ARGUMENT",
+                "message": "server name is too long",
+            }
         if not self.auto_append_default_port and self._has_invalid_port_segment(
             raw_address
         ):
@@ -1191,6 +1328,28 @@ class Main(Star):
             }
 
         address = self._normalize_address(raw_address)
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            existing_servers: dict[str, dict[str, Any]] = session_obj["servers"]
+            if address in existing_servers:
+                return {
+                    "ok": False,
+                    "server": str(existing_servers[address].get("name", desired_name)),
+                    "address": address,
+                    "error": "SERVER_ALREADY_EXISTS",
+                    "message": "server already exists",
+                }
+            if len(existing_servers) >= self.max_servers_per_session:
+                return {
+                    "ok": False,
+                    "server": desired_name,
+                    "address": address,
+                    "error": "SERVER_LIMIT_REACHED",
+                    "message": "saved server limit reached for this session",
+                    "limit": self.max_servers_per_session,
+                }
+
         try:
             status = await self._fetch_server_status(address, need_players=False)
         except McServerInvalidAddressError:
@@ -1229,6 +1388,15 @@ class Main(Star):
                     "address": address,
                     "error": "SERVER_ALREADY_EXISTS",
                     "message": "server already exists",
+                }
+            if len(servers) >= self.max_servers_per_session:
+                return {
+                    "ok": False,
+                    "server": desired_name,
+                    "address": address,
+                    "error": "SERVER_LIMIT_REACHED",
+                    "message": "saved server limit reached for this session",
+                    "limit": self.max_servers_per_session,
                 }
 
             final_name, name_duplicated = self._resolve_unique_server_name(
@@ -1343,10 +1511,12 @@ class Main(Star):
                     "error": "SAVE_FAILED",
                     "message": "server save failed",
                 }
+            referenced_addresses = self._collect_referenced_addresses(store)
 
         for address in addresses:
             self._clear_query_render_cache(session_key, address)
-            self._delete_server_cache(address)
+            if address not in referenced_addresses:
+                self._delete_server_cache(address)
         self._clear_tool_status_cache(session_key)
         self._clear_tool_list_cache(session_key)
 
@@ -1425,6 +1595,7 @@ class Main(Star):
                     "message": "server save failed",
                 }
 
+        self._clear_query_render_cache(session_key, address)
         self._clear_tool_status_cache(session_key)
         self._clear_tool_list_cache(session_key)
         return {
@@ -1479,7 +1650,6 @@ class Main(Star):
                     "message": f"multiple saved servers use name '{server_name}'",
                 }
             old_address = matched[0]
-            old_server = dict(servers[old_address])  # 浅拷贝，避免持锁操作
 
         # 2) 锁外验证新地址（网络 I/O，不阻塞其他操作）
         try:
@@ -1512,8 +1682,9 @@ class Main(Star):
             session_obj = self._get_or_create_session(store, session_key)
             servers = session_obj["servers"]
 
-            # 二次校验：服务器是否仍存在
-            if old_address not in servers:
+            # 二次校验并重新读取最新记录，避免覆盖网络等待期间的更新。
+            current_server = servers.get(old_address)
+            if not current_server:
                 return {
                     "ok": False,
                     "server_name": server_name,
@@ -1531,8 +1702,9 @@ class Main(Star):
                     "message": f"new address already used by '{conflict_name}'",
                 }
 
+            moved_server = dict(current_server)
             del servers[old_address]
-            servers[new_address] = old_server
+            servers[new_address] = moved_server
             servers[new_address]["address"] = new_address
             servers[new_address]["motd"] = str(status.motd or "")
             servers[new_address]["last_latency"] = status.latency
@@ -1552,7 +1724,7 @@ class Main(Star):
         self._clear_query_render_cache(session_key, old_address)
         return {
             "ok": True,
-            "server_name": old_server.get("name", server_name),
+            "server_name": moved_server.get("name", server_name),
             "old_address": old_address,
             "new_address": new_address,
             "latency": status.latency,
@@ -2015,7 +2187,14 @@ class Main(Star):
         # Build a reverse index so the same address is queried only once per round.
         address_to_sessions: dict[str, list[str]] = {}
         for session_key, session_obj in sessions.items():
-            for address in session_obj.get("servers", {}):
+            if not isinstance(session_key, str) or not isinstance(session_obj, dict):
+                continue
+            servers = session_obj.get("servers", {})
+            if not isinstance(servers, dict):
+                continue
+            for address in servers:
+                if not isinstance(address, str):
+                    continue
                 address_to_sessions.setdefault(address, []).append(session_key)
 
         if not address_to_sessions:
@@ -2073,8 +2252,26 @@ class Main(Star):
         if not players:
             return []
 
+        bounded_players: list[dict[str, str]] = []
+        for player in players[: _query_mod.MAX_PLAYER_SAMPLES]:
+            if not isinstance(player, dict):
+                continue
+            name = str(player.get("name", "") or "")[
+                : _query_mod.MAX_PLAYER_NAME_LENGTH
+            ]
+            if not name:
+                continue
+            bounded_players.append(
+                {"name": name, "uid": str(player.get("uid", "") or "")[:64]}
+            )
+        if not bounded_players:
+            return []
+
         if not self._session:
-            return [{"name": player["name"], "avatar_path": ""} for player in players]
+            return [
+                {"name": player["name"], "avatar_path": ""}
+                for player in bounded_players
+            ]
 
         now = int(time.time())
         semaphore = self._avatar_download_semaphore or asyncio.Semaphore(
@@ -2083,42 +2280,57 @@ class Main(Star):
 
         async def _resolve_one(player: dict[str, str]) -> dict[str, str]:
             name = player["name"]
-            uid = _cache_mod.normalize_player_uid(player.get("uid", ""), name)
-            avatar_path = self._skin_cache_path(address, uid)
-            avatar_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                uid = _cache_mod.normalize_player_uid(player.get("uid", ""), name)
+                avatar_path = self._skin_cache_path(address, uid)
+                avatar_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # 未过期则直接复用缓存
-            if (
-                avatar_path.exists()
-                and now - int(avatar_path.stat().st_mtime) <= self.cache_ttl_seconds
-            ):
-                return {"name": name, "avatar_path": str(avatar_path)}
-
-            # 新逻辑：先拉取皮肤图，再用 PILSkinMC 渲染为头像
-            file_lock = self._avatar_file_locks.setdefault(
-                str(avatar_path), asyncio.Lock()
-            )
-            async with file_lock:
+                # 未过期则直接复用缓存
                 if (
                     avatar_path.exists()
                     and now - int(avatar_path.stat().st_mtime) <= self.cache_ttl_seconds
                 ):
                     return {"name": name, "avatar_path": str(avatar_path)}
-                _ = await _avatar_mod.download_and_render_avatar_by_uuid(
-                    uid=uid,
-                    avatar_path=avatar_path,
-                    skin_api_url_template=self.skin_api_url_template,
-                    avatar_download_retries=self.avatar_download_retries,
-                    semaphore=semaphore,
-                    session=self._session,
+
+                # 新逻辑：先拉取皮肤图，再用 PILSkinMC 渲染为头像
+                file_lock = self._avatar_file_locks.setdefault(
+                    str(avatar_path), asyncio.Lock()
                 )
+                async with file_lock:
+                    if (
+                        avatar_path.exists()
+                        and now - int(avatar_path.stat().st_mtime)
+                        <= self.cache_ttl_seconds
+                    ):
+                        return {"name": name, "avatar_path": str(avatar_path)}
+                    _ = await _avatar_mod.download_and_render_avatar_by_uuid(
+                        uid=uid,
+                        avatar_path=avatar_path,
+                        skin_api_url_template=self.skin_api_url_template,
+                        avatar_download_retries=self.avatar_download_retries,
+                        semaphore=semaphore,
+                        session=self._session,
+                    )
 
-            return {
-                "name": name,
-                "avatar_path": str(avatar_path) if avatar_path.exists() else "",
-            }
+                return {
+                    "name": name,
+                    "avatar_path": str(avatar_path) if avatar_path.exists() else "",
+                }
+            except Exception as exc:
+                logger.debug("avatar cache failed for %r: %s", name, exc)
+                return {"name": name, "avatar_path": ""}
 
-        return await asyncio.gather(*[_resolve_one(player) for player in players])
+        fallback = [
+            {"name": player["name"], "avatar_path": ""} for player in bounded_players
+        ]
+        try:
+            return await asyncio.wait_for(
+                asyncio.gather(*[_resolve_one(player) for player in bounded_players]),
+                timeout=max(float(self.avatar_batch_timeout_seconds), 0.001),
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("avatar batch timed out for %s", address)
+            return fallback
 
     async def _cleanup_expired_cache(self) -> None:
         """清理过期缓存。
@@ -2133,29 +2345,26 @@ class Main(Star):
             sessions = store.get("sessions", {})
             session_server_map: dict[str, dict[str, Any]] = {}
             for session_obj in sessions.values():
-                for address, server_obj in session_obj.get("servers", {}).items():
-                    session_server_map[address] = server_obj
+                if not isinstance(session_obj, dict):
+                    continue
+                servers = session_obj.get("servers", {})
+                if not isinstance(servers, dict):
+                    continue
+                for address, server_obj in servers.items():
+                    if not isinstance(address, str) or not isinstance(server_obj, dict):
+                        continue
+                    current = session_server_map.get(address)
+                    if current is None or self._server_last_touch(
+                        server_obj
+                    ) > self._server_last_touch(current):
+                        session_server_map[address] = server_obj
 
         for address, server_obj in session_server_map.items():
             cache_dir = self._server_cache_dir(address)
             if not cache_dir.exists():
                 continue
 
-            try:
-                last_active_query_at = int(
-                    server_obj.get("last_active_query_at", 0) or 0
-                )
-            except Exception:
-                last_active_query_at = 0
-            try:
-                created_at = int(server_obj.get("created_at", 0) or 0)
-            except Exception:
-                created_at = 0
-            # 以“最近一次主动查询时间”为准；若从未主动查询，则回退到创建时间。
-            # 这样可满足“24h 内未查询则清理该服务器全部缓存”的需求。
-            last_touch_ts = (
-                last_active_query_at if last_active_query_at > 0 else created_at
-            )
+            last_touch_ts = self._server_last_touch(server_obj)
             if last_touch_ts > 0 and now - last_touch_ts > self.cache_ttl_seconds:
                 for file_path in cache_dir.rglob("*"):
                     if file_path.is_file():
@@ -2204,6 +2413,33 @@ class Main(Star):
                 and now - int(icon_file.stat().st_mtime) > self.cache_ttl_seconds
             ):
                 icon_file.unlink(missing_ok=True)
+
+    @staticmethod
+    def _server_last_touch(server_obj: dict[str, Any]) -> int:
+        try:
+            last_active = int(server_obj.get("last_active_query_at", 0) or 0)
+        except (TypeError, ValueError):
+            last_active = 0
+        try:
+            created_at = int(server_obj.get("created_at", 0) or 0)
+        except (TypeError, ValueError):
+            created_at = 0
+        return last_active if last_active > 0 else created_at
+
+    @staticmethod
+    def _collect_referenced_addresses(store: dict[str, Any]) -> set[str]:
+        addresses: set[str] = set()
+        sessions = store.get("sessions", {})
+        if not isinstance(sessions, dict):
+            return addresses
+        for session_obj in sessions.values():
+            if not isinstance(session_obj, dict):
+                continue
+            servers = session_obj.get("servers", {})
+            if not isinstance(servers, dict):
+                continue
+            addresses.update(address for address in servers if isinstance(address, str))
+        return addresses
 
     async def _load_store(self) -> dict[str, Any]:
         """读取插件存储。
@@ -2275,41 +2511,67 @@ class Main(Star):
             "silent_query_interval_seconds",
             SILENT_QUERY_INTERVAL_SECONDS,
             min_value=60,
+            max_value=7 * 24 * 60 * 60,
         )
         self.history_limit = self._get_config_int(
             "history_limit",
             HISTORY_LIMIT,
             min_value=1,
+            max_value=2_048,
         )
         self.cache_ttl_seconds = self._get_config_int(
             "cache_ttl_seconds",
             CACHE_TTL_SECONDS,
             min_value=60,
+            max_value=30 * 24 * 60 * 60,
         )
         self.status_timeout_seconds = self._get_config_int(
             "status_timeout_seconds",
             STATUS_TIMEOUT,
             min_value=1,
+            max_value=60,
         )
         self.query_all_concurrency = self._get_config_int(
             "query_all_concurrency",
             QUERY_ALL_CONCURRENCY,
             min_value=1,
+            max_value=20,
+        )
+        self.max_servers_per_session = self._get_config_int(
+            "max_servers_per_session",
+            MAX_SERVERS_PER_SESSION,
+            min_value=1,
+            max_value=500,
         )
         self.avatar_download_concurrency = self._get_config_int(
             "avatar_download_concurrency",
             AVATAR_DOWNLOAD_CONCURRENCY,
             min_value=1,
+            max_value=20,
         )
         self.avatar_download_retries = self._get_config_int(
             "avatar_download_retries",
             AVATAR_DOWNLOAD_RETRIES,
             min_value=0,
+            max_value=5,
+        )
+        self.avatar_batch_timeout_seconds = self._get_config_int(
+            "avatar_batch_timeout_seconds",
+            AVATAR_BATCH_TIMEOUT_SECONDS,
+            min_value=1,
+            max_value=120,
+        )
+        self.render_timeout_seconds = self._get_config_int(
+            "render_timeout_seconds",
+            RENDER_TIMEOUT_SECONDS,
+            min_value=1,
+            max_value=120,
         )
         self.query_result_cache_ttl_seconds = self._get_config_int(
             "query_result_cache_ttl_seconds",
             QUERY_RESULT_CACHE_TTL_SECONDS,
             min_value=1,
+            max_value=300,
         )
         self.skin_api_url_template = self._normalize_skin_api_url_template(
             self._get_config_str("skin_api_url_template", SKIN_API_URL_TEMPLATE)
@@ -2318,9 +2580,24 @@ class Main(Star):
             "auto_append_default_port",
             AUTO_APPEND_DEFAULT_PORT,
         )
+        self.mutation_requires_admin = self._get_config_bool(
+            "mutation_requires_admin",
+            MUTATION_REQUIRES_ADMIN,
+        )
+        self.direct_query_requires_admin = self._get_config_bool(
+            "direct_query_requires_admin",
+            DIRECT_QUERY_REQUIRES_ADMIN,
+        )
 
-    def _get_config_int(self, key: str, default: int, *, min_value: int = 0) -> int:
-        """读取整型配置并做下限保护。"""
+    def _get_config_int(
+        self,
+        key: str,
+        default: int,
+        *,
+        min_value: int = 0,
+        max_value: int | None = None,
+    ) -> int:
+        """Read an integer setting and clamp it to a safe range."""
         raw = (
             self._plugin_config.get(key, default)
             if hasattr(self._plugin_config, "get")
@@ -2332,7 +2609,8 @@ class Main(Star):
             value = int(raw)
         except (TypeError, ValueError):
             return default
-        return max(value, min_value)
+        value = max(value, min_value)
+        return min(value, max_value) if max_value is not None else value
 
     def _get_config_str(self, key: str, default: str) -> str:
         """读取字符串配置并做空值保护。"""
@@ -2370,8 +2648,30 @@ class Main(Star):
 
     @staticmethod
     def _normalize_skin_api_url_template(template: str) -> str:
-        """校验皮肤 API URL 模板，必须包含 {uuid} 占位符。"""
-        if "{uuid}" not in template:
+        """Validate a bounded HTTP(S) skin URL with only a UUID placeholder."""
+        if not template or len(template) > 2_048:
+            return SKIN_API_URL_TEMPLATE
+        try:
+            fields = []
+            for _, field_name, format_spec, conversion in Formatter().parse(template):
+                if field_name is None:
+                    continue
+                if field_name != "uuid" or format_spec or conversion:
+                    return SKIN_API_URL_TEMPLATE
+                fields.append(field_name)
+            if not fields:
+                return SKIN_API_URL_TEMPLATE
+            preview = template.format(uuid="0" * 32)
+            parsed = urlsplit(preview)
+        except (KeyError, TypeError, ValueError):
+            return SKIN_API_URL_TEMPLATE
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or any(char.isspace() or ord(char) < 32 for char in preview)
+        ):
             return SKIN_API_URL_TEMPLATE
         return template
 
@@ -2384,6 +2684,7 @@ class Main(Star):
             latency,
             now_ts,
             self.history_limit,
+            bucket_seconds=self.silent_query_interval_seconds,
         )
 
     def _build_render_history(
@@ -2469,6 +2770,17 @@ class Main(Star):
         return bool(sender_id and self_id and sender_id == self_id)
 
     @staticmethod
+    def _is_admin_event(event: AstrMessageEvent) -> bool:
+        try:
+            checker = getattr(event, "is_admin", None)
+            return bool(checker()) if callable(checker) else False
+        except Exception:
+            return False
+
+    def _is_mutation_denied(self, event: AstrMessageEvent) -> bool:
+        return self.mutation_requires_admin and not self._is_admin_event(event)
+
+    @staticmethod
     def _build_help_message() -> str:
         """构建命令帮助文案。"""
         return (
@@ -2509,8 +2821,11 @@ class Main(Star):
         renderer: _tl_mod.TemplateRenderer,
         **kwargs: Any,
     ) -> str:
-        """Delegate signature adaptation to the template loader module."""
-        return await _tl_mod.call_template_renderer(renderer, **kwargs)
+        """Render within a fixed total timeout."""
+        return await asyncio.wait_for(
+            _tl_mod.call_template_renderer(renderer, **kwargs),
+            timeout=max(float(self.render_timeout_seconds), 0.001),
+        )
 
     @staticmethod
     def _build_query_cache_key(
