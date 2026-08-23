@@ -49,6 +49,7 @@ McServerInvalidAddressError = _query_mod.McServerInvalidAddressError
 ADD_SERVER_PATTERN = re.compile(r"^/(?:添加服务器|添加)\s+(\S+)\s+(\S+)\s*$")
 QUERY_SERVER_PATTERN = re.compile(r"^/(?:查询服务器|查询)(?:\s+(\S+))?\s*$")
 DELETE_SERVER_PATTERN = re.compile(r"^/(?:删除服务器|删除)\s+(\S+)\s*$")
+CLEAR_DATA_PATTERN = re.compile(r"^/数据清除\s*$")
 RENAME_SERVER_PATTERN = re.compile(r"^/(?:重命名服务器|重命名)\s+(\S+)\s+(\S+)\s*$")
 LIST_SERVER_PATTERN = re.compile(r"^/(?:服务器列表|列表)\s*$")
 TEMPLATE_PATTERN = re.compile(r"^/模板(?:\s+(\S+))?\s*$")
@@ -56,12 +57,12 @@ TEMPLATE_RELOAD_PATTERN = re.compile(r"^/模板重载\s*$")
 REDIRECT_SERVER_PATTERN = re.compile(r"^/重定向\s+(\S+)\s+(\S+)\s*$")
 HELP_PATTERN = re.compile(r"^/(?:帮助|help)\s*$")
 COMMAND_FALLBACK_PATTERN = re.compile(
-    r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板重载|模板|帮助|help)(?:\s+.*)?$"
+    r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|数据清除|重命名服务器|重命名|重定向|服务器列表|列表|模板重载|模板|帮助|help)(?:\s+.*)?$"
 )
 
 # 是否自动补全默认端口（可被插件配置覆盖）
 AUTO_APPEND_DEFAULT_PORT = False
-# 写操作和未保存地址直连默认仅允许管理员
+# 群聊中的写操作和未保存地址直连默认仅允许管理员
 MUTATION_REQUIRES_ADMIN = True
 DIRECT_QUERY_REQUIRES_ADMIN = True
 # 静默轮询间隔：30 分钟
@@ -95,7 +96,7 @@ QUERY_RESULT_CACHE_TTL_SECONDS = 10
 QUERY_CACHE_CLEANUP_INTERVAL_SECONDS = 5 * 60
 # LLM Tool 返回结构版本
 TOOL_VERSION = "1.2"
-PLUGIN_VERSION = "v1.9.2"
+PLUGIN_VERSION = "v1.9.3"
 # Tool 查询状态缓存，避免 Agent 连续追问时重复打到 MC 服务端
 TOOL_STATUS_CACHE_TTL_SECONDS = 30
 # Tool 列表缓存，避免 Agent 连续追问列表细节时重复读取存储
@@ -347,7 +348,7 @@ class Main(Star):
                 )
                 return
 
-            if self.direct_query_requires_admin and not self._is_admin_event(event):
+            if self.direct_query_requires_admin and self._is_group_admin_denied(event):
                 yield event.plain_result("权限不足：直连未保存地址仅限管理员")
                 return
 
@@ -516,6 +517,33 @@ class Main(Star):
             f"删除成功！已删除服务器 [{target_name}] 共 {result.get('removed_count', 0)} 个，并清理对应缓存"
         )
 
+    # 安全边界：该高风险操作仅允许消息命令触发，禁止注册为 LLM Tool。
+    @filter.regex(r"^/数据清除\s*$")
+    async def clear_session_data(self, event: AstrMessageEvent):
+        """清除当前会话保存的全部服务器及不再被引用的对应缓存。"""
+        if self._should_ignore_self_event(event):
+            return
+        # 批量清除始终要求群管理员；私聊会话不需要管理员角色。
+        if self._is_group_admin_denied(event):
+            yield event.plain_result("权限不足：该操作仅限管理员")
+            return
+
+        result = await self._clear_session_data(event.unified_msg_origin)
+        if result.get("error") == "SAVE_FAILED":
+            yield event.plain_result("数据清除失败！服务器数据保存失败，请稍后重试")
+            return
+        if not result.get("ok"):
+            yield event.plain_result("数据清除失败！请稍后重试")
+            return
+
+        removed_count = int(result.get("removed_count", 0) or 0)
+        if removed_count == 0:
+            yield event.plain_result("当前会话暂无服务器数据可清除")
+            return
+        yield event.plain_result(
+            f"数据清除成功！已删除当前会话内 {removed_count} 个服务器，并清理对应缓存"
+        )
+
     @filter.regex(r"^/(?:服务器列表|列表)\s*$")
     async def list_servers(self, event: AstrMessageEvent):
         """列出当前会话内服务器：/服务器列表；或 /列表"""
@@ -547,7 +575,7 @@ class Main(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.regex(
-        r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
+        r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|数据清除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
     )
     async def command_help_and_format_guard(self, event: AstrMessageEvent):
         """命令帮助与格式兜底。"""
@@ -568,6 +596,7 @@ class Main(Star):
             ADD_SERVER_PATTERN,
             QUERY_SERVER_PATTERN,
             DELETE_SERVER_PATTERN,
+            CLEAR_DATA_PATTERN,
             RENAME_SERVER_PATTERN,
             LIST_SERVER_PATTERN,
             TEMPLATE_PATTERN,
@@ -648,8 +677,9 @@ class Main(Star):
         if rate_limited:
             return rate_limited
         try:
-            allow_direct = not self.direct_query_requires_admin or self._is_admin_event(
-                event
+            allow_direct = (
+                not self.direct_query_requires_admin
+                or not self._is_group_admin_denied(event)
             )
             cache_key = (
                 self._build_tool_status_cache_key(session_key, server)
@@ -1525,6 +1555,55 @@ class Main(Star):
             "server": target,
             "removed_count": len(removed),
             "removed": removed,
+        }
+
+    async def _clear_session_data(self, session_key: str) -> dict[str, Any]:
+        """Clear all saved servers in one session after a successful store write."""
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
+            addresses = list(servers)
+
+            if addresses:
+                session_obj["servers"] = {}
+                try:
+                    await self._save_store(store)
+                except Exception as exc:
+                    logger.exception("clear session data save failed: %s", exc)
+                    return {
+                        "ok": False,
+                        "error": "SAVE_FAILED",
+                        "message": "session server data save failed",
+                    }
+
+                referenced_addresses = self._collect_referenced_addresses(store)
+                unreferenced_addresses = [
+                    address
+                    for address in addresses
+                    if address not in referenced_addresses
+                ]
+            else:
+                unreferenced_addresses = []
+
+            for key in list(self._query_render_cache):
+                if key[0] == session_key:
+                    self._query_render_cache.pop(key, None)
+            self._clear_tool_status_cache(session_key)
+            self._clear_tool_list_cache(session_key)
+
+            if unreferenced_addresses:
+
+                def _delete_caches() -> None:
+                    for address in unreferenced_addresses:
+                        self._delete_server_cache(address)
+
+                await asyncio.to_thread(_delete_caches)
+
+        return {
+            "ok": True,
+            "removed_count": len(addresses),
+            "already_empty": not addresses,
         }
 
     async def _rename_server_data(
@@ -2777,8 +2856,19 @@ class Main(Star):
         except Exception:
             return False
 
+    @staticmethod
+    def _is_private_event(event: AstrMessageEvent) -> bool:
+        try:
+            checker = getattr(event, "is_private_chat", None)
+            return bool(checker()) if callable(checker) else False
+        except Exception:
+            return False
+
+    def _is_group_admin_denied(self, event: AstrMessageEvent) -> bool:
+        return not self._is_private_event(event) and not self._is_admin_event(event)
+
     def _is_mutation_denied(self, event: AstrMessageEvent) -> bool:
-        return self.mutation_requires_admin and not self._is_admin_event(event)
+        return self.mutation_requires_admin and self._is_group_admin_denied(event)
 
     @staticmethod
     def _build_help_message() -> str:
@@ -2791,6 +2881,7 @@ class Main(Star):
             "/查询 [服务器名称|服务器地址]\n"
             "/删除服务器 <服务器名称>\n"
             "/删除 <服务器名称>\n"
+            "/数据清除\n"
             "/重命名服务器 <旧名称> <新名称>\n"
             "/重命名 <旧名称> <新名称>\n"
             "/服务器列表\n"

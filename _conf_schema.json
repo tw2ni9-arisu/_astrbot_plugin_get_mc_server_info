@@ -31,14 +31,14 @@
   },
   "mutation_requires_admin": {
     "type": "bool",
-    "description": "Require administrator permission for saved-server and template mutations.",
-    "hint": "Default true. Applies to command handlers and LLM tools.",
+    "description": "Require administrator permission for saved-server and template mutations in group chats.",
+    "hint": "Default true. Applies to group command handlers and LLM tools; private chats are exempt.",
     "default": true
   },
   "direct_query_requires_admin": {
     "type": "bool",
-    "description": "Require administrator permission to query an unsaved address directly.",
-    "hint": "Default true. Queries of saved servers remain available to regular members.",
+    "description": "Require administrator permission to query an unsaved address directly in group chats.",
+    "hint": "Default true. Private chats and queries of saved servers are exempt.",
     "default": true
   },
   "query_all_concurrency": {
