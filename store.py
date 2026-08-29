@@ -35,6 +35,12 @@ def get_or_create_session(store: dict[str, Any], session_key: str) -> dict[str, 
     raw_servers = session_obj.get("servers")
     if not isinstance(raw_servers, dict):
         raw_servers = {}
+    primary_addresses = {
+        address
+        for address, server_obj in raw_servers.items()
+        if isinstance(address, str) and isinstance(server_obj, dict)
+    }
+    claimed_backup_addresses: set[str] = set()
     servers: dict[str, dict[str, Any]] = {}
     for address, server_obj in raw_servers.items():
         if not isinstance(address, str) or not isinstance(server_obj, dict):
@@ -48,6 +54,22 @@ def get_or_create_session(store: dict[str, Any], session_key: str) -> dict[str, 
             if isinstance(history, list)
             else []
         )
+        raw_backups = server_obj.get("backup_addresses", [])
+        backup_addresses: list[str] = []
+        if isinstance(raw_backups, list):
+            for value in raw_backups:
+                if not isinstance(value, str):
+                    continue
+                backup_address = value.strip()
+                if (
+                    not backup_address
+                    or backup_address in primary_addresses
+                    or backup_address in claimed_backup_addresses
+                ):
+                    continue
+                claimed_backup_addresses.add(backup_address)
+                backup_addresses.append(backup_address)
+        normalized["backup_addresses"] = backup_addresses
         servers[address] = normalized
     session_obj["servers"] = servers
 
@@ -57,6 +79,60 @@ def get_or_create_session(store: dict[str, Any], session_key: str) -> dict[str, 
     else:
         session_obj["template"] = template.strip()
     return session_obj
+
+
+def get_server_line_addresses(
+    primary_address: str,
+    server_obj: dict[str, Any],
+) -> list[str]:
+    """Return one logical server's primary and ordered backup addresses."""
+    addresses = [primary_address]
+    raw_backups = server_obj.get("backup_addresses", [])
+    if not isinstance(raw_backups, list):
+        return addresses
+    for value in raw_backups:
+        if not isinstance(value, str):
+            continue
+        backup_address = value.strip()
+        if backup_address and backup_address not in addresses:
+            addresses.append(backup_address)
+    return addresses
+
+
+def find_server_primary_by_line(
+    servers: dict[str, dict[str, Any]],
+    line_address: str,
+) -> str | None:
+    """Find the primary address that owns a saved primary or backup line."""
+    for primary_address, server_obj in servers.items():
+        if line_address in get_server_line_addresses(primary_address, server_obj):
+            return primary_address
+    return None
+
+
+def is_server_line_address_in_use(
+    servers: dict[str, dict[str, Any]],
+    line_address: str,
+    *,
+    exclude_primary: str | None = None,
+) -> bool:
+    """Return whether a session owns an address as a primary or backup line."""
+    for primary_address, server_obj in servers.items():
+        if primary_address == line_address and primary_address != exclude_primary:
+            return True
+        if line_address in get_server_line_addresses(primary_address, server_obj)[1:]:
+            return True
+    return False
+
+
+def get_session_server_addresses(
+    servers: dict[str, dict[str, Any]],
+) -> set[str]:
+    """Collect every primary and backup address referenced by a session."""
+    addresses: set[str] = set()
+    for primary_address, server_obj in servers.items():
+        addresses.update(get_server_line_addresses(primary_address, server_obj))
+    return addresses
 
 
 def find_server_addresses_by_name(

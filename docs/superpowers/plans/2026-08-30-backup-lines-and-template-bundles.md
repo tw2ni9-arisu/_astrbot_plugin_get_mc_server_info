@@ -166,9 +166,9 @@ def is_server_line_address_in_use(
     exclude_primary: str | None = None,
 ) -> bool:
     for primary_address, server_obj in servers.items():
-        if exclude_primary is not None and primary_address == exclude_primary:
-            continue
-        if line_address in get_server_line_addresses(primary_address, server_obj):
+        if primary_address == line_address and primary_address != exclude_primary:
+            return True
+        if line_address in get_server_line_addresses(primary_address, server_obj)[1:]:
             return True
     return False
 
