@@ -8,25 +8,70 @@ from __future__ import annotations
 import importlib.util
 import inspect
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 TemplateRenderer = Callable[..., Awaitable[str]]
 
 DEFAULT_TEMPLATE_NAME = "default_method"
+RENDERER_EXPORTS = {
+    "query": "render_server_report_image",
+    "list": "render_server_list_image",
+}
+
+
+@dataclass(frozen=True)
+class TemplateBundle:
+    """A validated query/list renderer directory."""
+
+    name: str
+    directory: Path
+    query_file: Path
+    list_file: Path
+
+
+def discover_templates(templates_dir: Path) -> dict[str, TemplateBundle]:
+    """Discover valid immediate-child template bundles by public query name."""
+    bundles: dict[str, TemplateBundle] = {}
+    duplicate_names: set[str] = set()
+    if not templates_dir.is_dir():
+        return bundles
+
+    directories = sorted(
+        (path for path in templates_dir.iterdir() if path.is_dir()),
+        key=lambda path: path.name,
+    )
+    for directory in directories:
+        query_files = sorted(directory.glob("*_query.py"))
+        list_files = sorted(directory.glob("*_list.py"))
+        fonts = [
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() == ".ttf"
+        ]
+        if len(query_files) != 1 or len(list_files) != 1 or len(fonts) > 1:
+            continue
+
+        public_name = query_files[0].stem.removesuffix("_query")
+        if not is_valid_template_name(public_name) or public_name in duplicate_names:
+            continue
+        if public_name in bundles:
+            bundles.pop(public_name, None)
+            duplicate_names.add(public_name)
+            continue
+        bundles[public_name] = TemplateBundle(
+            name=public_name,
+            directory=directory,
+            query_file=query_files[0],
+            list_file=list_files[0],
+        )
+    return bundles
 
 
 def list_templates(templates_dir: Path) -> list[str]:
-    """列出模板目录中的可用模板名（不带 .py）。"""
-    if not templates_dir.exists():
-        return []
-    names: list[str] = []
-    for path in templates_dir.glob("*.py"):
-        if path.name == "__init__.py":
-            continue
-        names.append(path.stem)
-    names.sort()
-    return names
+    """List validated public template names."""
+    return sorted(discover_templates(templates_dir))
 
 
 def is_valid_template_name(name: str) -> bool:
@@ -37,41 +82,57 @@ def is_valid_template_name(name: str) -> bool:
     return bool(name) and name.isidentifier()
 
 
-def template_file_path(templates_dir: Path, template_name: str) -> Path:
-    """根据模板名获取模板文件路径。"""
-    return templates_dir / f"{template_name}.py"
+def template_file_path(
+    templates_dir: Path,
+    template_name: str,
+    mode: str = "query",
+) -> Path:
+    """Resolve one role file from a validated template bundle."""
+    if mode not in RENDERER_EXPORTS:
+        raise ValueError("invalid template renderer mode")
+    bundle = discover_templates(templates_dir).get(template_name)
+    if bundle is None:
+        raise FileNotFoundError(template_name)
+    return bundle.query_file if mode == "query" else bundle.list_file
 
 
 async def get_template_renderer(
     template_name: str,
+    mode: str,
     templates_dir: Path,
-    renderer_cache: dict[str, tuple[float, TemplateRenderer]],
+    renderer_cache: dict[tuple[str, str], tuple[float, TemplateRenderer]],
 ) -> TemplateRenderer:
     """获取模板渲染函数。
 
-    约定模板文件必须提供：
-        async def render_server_report_image(...)
+    Query modules export ``render_server_report_image`` and list modules export
+    ``render_server_list_image``.
 
     Args:
-        template_name: 模板名称（不含 .py）
-        templates_dir: 模板文件所在目录
-        renderer_cache: 模板渲染函数缓存字典，键为模板名，值为 (mtime, renderer)
+        template_name: Public template name.
+        mode: ``query`` or ``list``.
+        templates_dir: Root containing bundle directories.
+        renderer_cache: Cache keyed by ``(template_name, mode)``.
     """
     if not is_valid_template_name(template_name):
         raise ValueError("invalid template name")
+    export_name = RENDERER_EXPORTS.get(mode)
+    if export_name is None:
+        raise ValueError("invalid template renderer mode")
 
-    template_file = template_file_path(templates_dir, template_name)
-    if not template_file.exists():
-        raise FileNotFoundError(str(template_file))
-    current_mtime = template_file.stat().st_mtime
+    template_file = template_file_path(templates_dir, template_name, mode)
+    current_mtime = float(template_file.stat().st_mtime_ns)
 
-    cached = renderer_cache.get(template_name)
+    cache_key = (template_name, mode)
+    cached = renderer_cache.get(cache_key)
     if cached:
         cached_mtime, cached_renderer = cached
         if cached_mtime == current_mtime:
             return cached_renderer
 
-    module_name = f"astrbot_plugin_get_mc_server_info_template_{template_name}"
+    module_name = (
+        "astrbot_plugin_get_mc_server_info_template_"
+        f"{template_name}_{mode}_{template_file.stat().st_mtime_ns}"
+    )
     spec = importlib.util.spec_from_file_location(module_name, template_file)
     if not spec or not spec.loader:
         raise RuntimeError("cannot build module spec")
@@ -79,13 +140,13 @@ async def get_template_renderer(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    renderer = getattr(module, "render_server_report_image", None)
+    renderer = getattr(module, export_name, None)
     if not renderer or not callable(renderer):
-        raise AttributeError("missing render_server_report_image")
+        raise AttributeError(f"missing {export_name}")
     if not inspect.iscoroutinefunction(renderer):
-        raise TypeError("render_server_report_image must be async")
+        raise TypeError(f"{export_name} must be async")
 
-    renderer_cache[template_name] = (current_mtime, renderer)
+    renderer_cache[cache_key] = (current_mtime, renderer)
     return renderer
 
 

@@ -55,6 +55,10 @@ def _list_custom_fonts() -> list[Path]:
     paths: list[Path] = []
     for extension in CUSTOM_FONT_EXTENSIONS:
         paths.extend(sorted(template_dir.glob(f"*{extension}")))
+    if not paths:
+        default_template_dir = template_dir.parent / "default_method"
+        for extension in CUSTOM_FONT_EXTENSIONS:
+            paths.extend(sorted(default_template_dir.glob(f"*{extension}")))
     _CUSTOM_FONT_PATHS = paths
     return paths
 
@@ -98,9 +102,13 @@ def _truncate_text(
 
 
 def _server_icon(icon_path: str | None) -> Image.Image:
-    default_icon_path = Path(__file__).resolve().parent / "default_icon.png"
+    default_icon_path = _find_named_image(
+        Path(__file__).resolve().parent,
+        "default_icon",
+    )
     candidates = [Path(icon_path)] if icon_path else []
-    candidates.append(default_icon_path)
+    if default_icon_path is not None:
+        candidates.append(default_icon_path)
 
     for file_path in candidates:
         if not file_path.exists():
@@ -127,10 +135,9 @@ def _load_template_background(width: int, height: int) -> Image.Image | None:
     """Load a same-named background image and fit it to the rendered canvas."""
     template_file = Path(__file__).resolve()
     parent = template_file.parent
-    for extension in ("png", "jpg", "jpeg", "webp", "bmp"):
-        candidate = parent / f"{template_file.stem}.{extension}"
-        if not candidate.exists():
-            continue
+    public_name = template_file.stem.removesuffix("_query")
+    candidate = _find_named_image(parent, public_name)
+    if candidate is not None:
         try:
             image = Image.open(candidate).convert("RGBA")
             return ImageOps.fit(
@@ -139,7 +146,16 @@ def _load_template_background(width: int, height: int) -> Image.Image | None:
                 method=Image.Resampling.LANCZOS,
             )
         except OSError:
+            pass
+    return None
+
+
+def _find_named_image(directory: Path, stem: str) -> Path | None:
+    for candidate in directory.iterdir():
+        if not candidate.is_file() or candidate.stem != stem:
             continue
+        if candidate.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+            return candidate
     return None
 
 

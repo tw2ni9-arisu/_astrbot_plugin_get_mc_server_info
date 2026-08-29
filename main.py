@@ -178,7 +178,7 @@ class Main(Star):
         self._templates_dir = Path(__file__).resolve().parent / "templates"
         # 模板渲染函数缓存，避免每次查询都重复加载文件
         self._template_renderer_cache: dict[
-            str, tuple[float, _tl_mod.TemplateRenderer]
+            tuple[str, str], tuple[float, _tl_mod.TemplateRenderer]
         ] = {}
         # 运行时配置（支持插件配置覆盖）
         self.silent_query_interval_seconds = SILENT_QUERY_INTERVAL_SECONDS
@@ -476,10 +476,7 @@ class Main(Star):
             yield event.plain_result("请求过于频繁，请稍后再试")
             return
 
-        if (
-            template_name == "reload"
-            and not self._template_file_path(template_name).is_file()
-        ):
+        if template_name == "reload" and template_name not in self._list_templates():
             self._reload_template_caches()
             yield event.plain_result("模板缓存已重载")
             return
@@ -2278,7 +2275,8 @@ class Main(Star):
             }
 
         try:
-            await self._get_template_renderer(template_name)
+            await self._get_template_renderer(template_name, mode="query")
+            await self._get_template_renderer(template_name, mode="list")
         except Exception as exc:
             logger.warning("template load failed: %s", exc)
             return {
@@ -3052,16 +3050,23 @@ class Main(Star):
         """委托到 template_loader 模块。"""
         return _tl_mod.is_valid_template_name(name)
 
-    def _template_file_path(self, template_name: str) -> Path:
+    def _template_file_path(self, template_name: str, mode: str = "query") -> Path:
         """委托到 template_loader 模块。"""
-        return _tl_mod.template_file_path(self._templates_dir, template_name)
+        return _tl_mod.template_file_path(
+            self._templates_dir,
+            template_name,
+            mode,
+        )
 
     async def _get_template_renderer(
-        self, template_name: str
+        self,
+        template_name: str,
+        mode: str = "query",
     ) -> _tl_mod.TemplateRenderer:
         """Delegate renderer loading to the template loader module."""
         return await _tl_mod.get_template_renderer(
             template_name,
+            mode,
             self._templates_dir,
             self._template_renderer_cache,
         )

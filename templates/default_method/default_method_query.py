@@ -78,7 +78,8 @@ def _latency_color(latency: int) -> tuple[int, int, int]:
 
 
 def _server_icon(icon_path: str | None) -> Image.Image:
-    default_icon_path = Path(__file__).resolve().parent / "default_icon.png"
+    template_dir = Path(__file__).resolve().parent
+    default_icon_path = _find_named_image(template_dir, "default_icon")
     for file_path in (Path(icon_path) if icon_path else None, default_icon_path):
         if file_path and file_path.exists():
             try:
@@ -95,17 +96,24 @@ def _server_icon(icon_path: str | None) -> Image.Image:
 
 def _load_template_background(width: int, height: int) -> Image.Image | None:
     template_file = Path(__file__).resolve()
-    stem = template_file.stem
+    stem = template_file.stem.removesuffix("_query")
     parent = template_file.parent
-    for ext in ("png", "jpg", "jpeg", "webp", "bmp"):
-        candidate = parent / f"{stem}.{ext}"
-        if not candidate.exists():
-            continue
+    candidate = _find_named_image(parent, stem)
+    if candidate is not None:
         try:
             img = Image.open(candidate).convert("RGBA")
             return ImageOps.fit(img, (width, height), method=Image.Resampling.LANCZOS)
         except OSError:
+            pass
+    return None
+
+
+def _find_named_image(directory: Path, stem: str) -> Path | None:
+    for candidate in directory.iterdir():
+        if not candidate.is_file() or candidate.stem != stem:
             continue
+        if candidate.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+            return candidate
     return None
 
 
