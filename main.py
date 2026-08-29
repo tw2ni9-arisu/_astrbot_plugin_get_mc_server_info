@@ -137,6 +137,17 @@ class ToolListCacheEntry:
     servers: list[dict[str, Any]]
 
 
+@dataclass
+class SavedServerQueryResult:
+    """Result of querying one logical server through its ordered lines."""
+
+    status: ServerStatus | None
+    address: str
+    line_type: str
+    attempted_addresses: list[str]
+    error: str | None = None
+
+
 class Main(Star):
     """插件入口类。
 
@@ -403,8 +414,12 @@ class Main(Star):
                 return
 
             normalized_query = self._normalize_address(query_token)
-            if normalized_query in servers:
-                yield await self._query_single_server(event, normalized_query)
+            primary_address = _store_mod.find_server_primary_by_line(
+                servers,
+                normalized_query,
+            )
+            if primary_address is not None:
+                yield await self._query_single_server(event, primary_address)
                 return
 
             # 未命中已添加的服务器名称时，尝试按地址直连查询；
@@ -1276,11 +1291,15 @@ class Main(Star):
             }
 
         if matched_addresses:
-            address = matched_addresses[0]
-            managed = True
+            primary_address = matched_addresses[0]
         else:
-            address = self._normalize_address(query_token)
-            managed = address in servers
+            normalized_address = self._normalize_address(query_token)
+            primary_address = _store_mod.find_server_primary_by_line(
+                servers,
+                normalized_address,
+            )
+        managed = primary_address is not None
+        address = primary_address if managed else self._normalize_address(query_token)
         if not managed and not allow_direct:
             return {
                 "ok": False,
@@ -1296,41 +1315,79 @@ class Main(Star):
             saved_server.get("name", query_token if managed else address)
         )
 
-        try:
-            status = await self._fetch_server_status(address, need_players=False)
-        except McServerInvalidAddressError:
-            return {
-                "ok": False,
-                "online": False,
-                "server": display_name,
-                "address": address,
-                "managed": managed,
-                "error": "INVALID_ADDRESS",
-                "message": "server address must resolve to public IP addresses",
-            }
-        except McServerTimeoutError:
-            return {
-                "ok": False,
-                "online": False,
-                "server": display_name,
-                "address": address,
-                "managed": managed,
-                "error": "CONNECTION_TIMEOUT",
-                "message": "server connection timed out",
-            }
-        except McServerConnectionError:
-            return {
-                "ok": False,
-                "online": False,
-                "server": display_name,
-                "address": address,
-                "managed": managed,
-                "error": "CONNECTION_FAILED",
-                "message": "server connection failed",
-            }
+        if managed:
+            query_result = await self._query_saved_server_lines(
+                address,
+                saved_server,
+                need_players=False,
+            )
+            if query_result.status is None:
+                error = query_result.error or "CONNECTION_FAILED"
+                messages = {
+                    "INVALID_ADDRESS": (
+                        "server address must resolve to public IP addresses"
+                    ),
+                    "CONNECTION_TIMEOUT": "server connection timed out",
+                    "CONNECTION_FAILED": "server connection failed",
+                }
+                return {
+                    "ok": False,
+                    "online": False,
+                    "server": display_name,
+                    "primary_address": address,
+                    "address": query_result.address,
+                    "line_type": query_result.line_type,
+                    "attempted_addresses": query_result.attempted_addresses,
+                    "managed": True,
+                    "error": error,
+                    "message": messages.get(error, "server connection failed"),
+                }
+            status = query_result.status
+            actual_address = query_result.address
+            line_type = query_result.line_type
+            attempted_addresses = query_result.attempted_addresses
+        else:
+            try:
+                status = await self._fetch_server_status(
+                    address,
+                    need_players=False,
+                )
+            except McServerInvalidAddressError:
+                return {
+                    "ok": False,
+                    "online": False,
+                    "server": display_name,
+                    "address": address,
+                    "managed": False,
+                    "error": "INVALID_ADDRESS",
+                    "message": "server address must resolve to public IP addresses",
+                }
+            except McServerTimeoutError:
+                return {
+                    "ok": False,
+                    "online": False,
+                    "server": display_name,
+                    "address": address,
+                    "managed": False,
+                    "error": "CONNECTION_TIMEOUT",
+                    "message": "server connection timed out",
+                }
+            except McServerConnectionError:
+                return {
+                    "ok": False,
+                    "online": False,
+                    "server": display_name,
+                    "address": address,
+                    "managed": False,
+                    "error": "CONNECTION_FAILED",
+                    "message": "server connection failed",
+                }
+            actual_address = address
+            line_type = "direct"
+            attempted_addresses = [address]
 
         now = int(time.time())
-        await self._cache_server_icon(address, status.icon_base64)
+        await self._cache_server_icon(actual_address, status.icon_base64)
 
         if managed:
             async with self._store_lock:
@@ -1355,12 +1412,20 @@ class Main(Star):
             self._clear_tool_list_cache(session_key)
 
         await self._cleanup_expired_cache()
-        return self._server_status_to_tool_data(
+        result = self._server_status_to_tool_data(
             status,
             server_name=display_name,
-            address=address,
+            address=actual_address,
             managed=managed,
         )
+        result.update(
+            {
+                "primary_address": address,
+                "line_type": line_type,
+                "attempted_addresses": attempted_addresses,
+            }
+        )
+        return result
 
     async def _query_history_status_data(
         self, session_key: str, server: str
@@ -2252,6 +2317,62 @@ class Main(Star):
 
         return {"ok": True, "template": template_name, "already_active": False}
 
+    async def _query_saved_server_lines(
+        self,
+        primary_address: str,
+        server_obj: dict[str, Any],
+        *,
+        need_players: bool,
+    ) -> SavedServerQueryResult:
+        """Query a logical server's primary and backups in saved order."""
+        attempted_addresses: list[str] = []
+        last_error = "CONNECTION_FAILED"
+        for index, line_address in enumerate(
+            _store_mod.get_server_line_addresses(primary_address, server_obj)
+        ):
+            attempted_addresses.append(line_address)
+            try:
+                status = await self._fetch_server_status(
+                    line_address,
+                    need_players=need_players,
+                )
+            except McServerInvalidAddressError:
+                last_error = "INVALID_ADDRESS"
+            except McServerTimeoutError:
+                last_error = "CONNECTION_TIMEOUT"
+            except McServerConnectionError:
+                last_error = "CONNECTION_FAILED"
+            else:
+                return SavedServerQueryResult(
+                    status=status,
+                    address=line_address,
+                    line_type="primary" if index == 0 else "backup",
+                    attempted_addresses=attempted_addresses,
+                )
+
+        return SavedServerQueryResult(
+            status=None,
+            address=primary_address,
+            line_type="primary",
+            attempted_addresses=attempted_addresses,
+            error=last_error,
+        )
+
+    def _find_cached_server_icon(
+        self,
+        primary_address: str,
+        server_obj: dict[str, Any],
+    ) -> Path | None:
+        """Return the first cached icon following primary/backup order."""
+        for line_address in _store_mod.get_server_line_addresses(
+            primary_address,
+            server_obj,
+        ):
+            icon_path = self._icon_cache_path(line_address)
+            if icon_path.is_file():
+                return icon_path
+        return None
+
     @staticmethod
     def _server_status_to_tool_data(
         status: ServerStatus,
@@ -2309,10 +2430,14 @@ class Main(Star):
                 .base64_image(cached_image)
             )
 
-        # 1) 拉取服务端状态（含玩家 sample）
-        try:
-            status = await self._fetch_server_status(address, need_players=True)
-        except Exception:
+        # 1) 按主线路、备用线路顺序拉取服务端状态（含玩家 sample）
+        query_result = await self._query_saved_server_lines(
+            address,
+            server_obj,
+            need_players=True,
+        )
+        status = query_result.status
+        if status is None:
             self._clear_query_render_cache(session_key, address)
             history = server_obj.get("latency_history", [])
             if not isinstance(history, list):
@@ -2321,7 +2446,7 @@ class Main(Star):
             if not cached_motd:
                 cached_motd = DEFAULT_OFFLINE_MOTD
             now = int(time.time())
-            icon_path = self._icon_cache_path(address)
+            icon_path = self._find_cached_server_icon(address, server_obj)
             renderer = await self._get_template_renderer(template_name)
             image_b64 = await self._call_template_renderer(
                 renderer,
@@ -2338,12 +2463,13 @@ class Main(Star):
                     now_ts=now,
                 ),
                 history_title=self._build_history_title(),
-                icon_path=str(icon_path) if icon_path.exists() else None,
+                icon_path=str(icon_path) if icon_path is not None else None,
                 players=[],
             )
             return event.make_result().base64_image(image_b64)
 
         # 2) 写回最新延迟、历史与 Motd
+        actual_address = query_result.address
         now = int(time.time())
         async with self._store_lock:
             store = await self._load_store()
@@ -2359,19 +2485,19 @@ class Main(Star):
             await self._save_store(store)
 
         # 3) 刷新图标与玩家头像缓存，清理过期缓存并生成渲染图
-        await self._cache_server_icon(address, status.icon_base64)
+        await self._cache_server_icon(actual_address, status.icon_base64)
         players_for_render = await self._cache_and_collect_player_avatars(
-            address,
+            actual_address,
             status.players,
         )
         await self._cleanup_expired_cache()
-        icon_path = self._icon_cache_path(address)
+        icon_path = self._icon_cache_path(actual_address)
         render_history = self._build_render_history(history, now_ts=now)
         renderer = await self._get_template_renderer(template_name)
         image_b64 = await self._call_template_renderer(
             renderer,
             server_name=server_name,
-            server_address=address,
+            server_address=actual_address,
             latency=status.latency,
             players_online=status.players_online,
             players_max=status.players_max,
