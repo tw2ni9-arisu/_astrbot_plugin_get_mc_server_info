@@ -2677,50 +2677,100 @@ class Main(Star):
         """执行一轮静默查询。
 
         去重策略：
-        - 先聚合“地址 -> 会话列表”；
-        - 相同地址仅查询一次，再同步写回多个会话。
+        - 聚合所有逻辑服务器的主线路和备用线路；
+        - 相同地址仅查询一次；
+        - 每个逻辑服务器记录成功线路中的最大延迟，全部失败则记录 0。
         """
         async with self._store_lock:
             store = await self._load_store()
             sessions = store.get("sessions", {})
 
-        # Build a reverse index so the same address is queried only once per round.
-        address_to_sessions: dict[str, list[str]] = {}
+        line_addresses: list[str] = []
+        seen_addresses: set[str] = set()
+        logical_servers: set[tuple[str, str]] = set()
         for session_key, session_obj in sessions.items():
             if not isinstance(session_key, str) or not isinstance(session_obj, dict):
                 continue
             servers = session_obj.get("servers", {})
             if not isinstance(servers, dict):
                 continue
-            for address in servers:
-                if not isinstance(address, str):
+            for primary_address, server_obj in servers.items():
+                if not isinstance(primary_address, str) or not isinstance(
+                    server_obj,
+                    dict,
+                ):
                     continue
-                address_to_sessions.setdefault(address, []).append(session_key)
+                logical_servers.add((session_key, primary_address))
+                for line_address in _store_mod.get_server_line_addresses(
+                    primary_address,
+                    server_obj,
+                ):
+                    if line_address in seen_addresses:
+                        continue
+                    seen_addresses.add(line_address)
+                    line_addresses.append(line_address)
 
-        if not address_to_sessions:
+        if not line_addresses:
             return
 
-        now = int(time.time())
-        for address, related_sessions in address_to_sessions.items():
-            # 静默失败直接跳过，不产生用户侧噪音
-            try:
-                status = await self._fetch_server_status(address, need_players=False)
-            except Exception as exc:
-                logger.warning("silent query failed for %s: %s", address, exc)
-                continue
+        semaphore = asyncio.Semaphore(self.query_all_concurrency)
 
-            async with self._store_lock:
-                store = await self._load_store()
-                for session_key in related_sessions:
-                    session_obj = self._get_or_create_session(store, session_key)
-                    server_obj = session_obj["servers"].get(address)
-                    if not server_obj:
-                        continue
-                    server_obj["last_latency"] = status.latency
-                    server_obj["last_silent_query_at"] = now
-                    server_obj["motd"] = str(status.motd or "")
-                    self._append_latency(server_obj, status.latency, now)
-                await self._save_store(store)
+        async def _query_line(
+            line_address: str,
+        ) -> tuple[str, ServerStatus | None]:
+            async with semaphore:
+                try:
+                    status = await self._fetch_server_status(
+                        line_address,
+                        need_players=False,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "silent query failed for %s: %s",
+                        line_address,
+                        exc,
+                    )
+                    return line_address, None
+                return line_address, status
+
+        queried = await asyncio.gather(
+            *[_query_line(line_address) for line_address in line_addresses]
+        )
+        status_by_address = dict(queried)
+        now = int(time.time())
+        async with self._store_lock:
+            store = await self._load_store()
+            sessions = store.get("sessions", {})
+            for session_key, primary_address in logical_servers:
+                session_obj = sessions.get(session_key)
+                if not isinstance(session_obj, dict):
+                    continue
+                servers = session_obj.get("servers", {})
+                if not isinstance(servers, dict):
+                    continue
+                server_obj = servers.get(primary_address)
+                if not isinstance(server_obj, dict):
+                    continue
+                successful = [
+                    status_by_address[line_address]
+                    for line_address in _store_mod.get_server_line_addresses(
+                        primary_address,
+                        server_obj,
+                    )
+                    if status_by_address.get(line_address) is not None
+                ]
+                selected = (
+                    max(successful, key=lambda status: status.latency)
+                    if successful
+                    else None
+                )
+                latency = selected.latency if selected is not None else 0
+                server_obj["last_latency"] = latency
+                server_obj["last_silent_query_at"] = now
+                if selected is not None:
+                    server_obj["motd"] = str(selected.motd or "")
+                self._append_latency(server_obj, latency, now)
+            await self._save_store(store)
 
     async def _fetch_server_status(
         self,
