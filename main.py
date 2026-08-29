@@ -47,6 +47,10 @@ McServerTimeoutError = _query_mod.McServerTimeoutError
 McServerInvalidAddressError = _query_mod.McServerInvalidAddressError
 
 ADD_SERVER_PATTERN = re.compile(r"^/(?:添加服务器|添加)\s+(\S+)\s+(\S+)\s*$")
+BACKUP_SERVER_PATTERN = re.compile(
+    r"^/(?:备用线路|备用|bak)\s+(\S+)\s+(\S+)\s*$",
+    re.IGNORECASE,
+)
 QUERY_SERVER_PATTERN = re.compile(r"^/(?:查询服务器|查询)(?:\s+(\S+))?\s*$")
 DELETE_SERVER_PATTERN = re.compile(r"^/(?:删除服务器|删除)\s+(\S+)\s*$")
 CLEAR_DATA_PATTERN = re.compile(r"^/数据清除\s*$")
@@ -57,7 +61,8 @@ TEMPLATE_RELOAD_PATTERN = re.compile(r"^/模板重载\s*$")
 REDIRECT_SERVER_PATTERN = re.compile(r"^/重定向\s+(\S+)\s+(\S+)\s*$")
 HELP_PATTERN = re.compile(r"^/(?:帮助|help)\s*$")
 COMMAND_FALLBACK_PATTERN = re.compile(
-    r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|数据清除|重命名服务器|重命名|重定向|服务器列表|列表|模板重载|模板|帮助|help)(?:\s+.*)?$"
+    r"^/(?:添加服务器|添加|备用线路|备用|bak|查询服务器|查询|删除服务器|删除|数据清除|重命名服务器|重命名|重定向|服务器列表|列表|模板重载|模板|帮助|help)(?:\s+.*)?$",
+    re.IGNORECASE,
 )
 
 # 是否自动补全默认端口（可被插件配置覆盖）
@@ -295,6 +300,68 @@ class Main(Star):
             )
             return
         yield event.plain_result(f"添加成功！服务器 [{final_name}] 已添加")
+
+    @filter.regex(r"(?i)^/(?:备用线路|备用|bak)\s+\S+\s+\S+\s*$")
+    async def add_backup_server(self, event: AstrMessageEvent):
+        """为已保存服务器添加备用线路。"""
+        if self._should_ignore_self_event(event):
+            return
+        if self._is_group_admin_denied(event):
+            yield event.plain_result("权限不足：该操作仅限管理员")
+            return
+        if self._check_command_rate_limit(event):
+            yield event.plain_result("请求过于频繁，请稍后再试")
+            return
+
+        matched = BACKUP_SERVER_PATTERN.match(event.message_str.strip())
+        if not matched:
+            yield event.plain_result(self._build_help_message())
+            return
+
+        server_name = matched.group(1).strip()
+        raw_address = matched.group(2).strip()
+        result = await self._add_backup_server_data(
+            event.unified_msg_origin,
+            server_name,
+            raw_address,
+        )
+        error = result.get("error")
+        if error == "SERVER_NOT_FOUND":
+            yield event.plain_result(
+                f"备用线路添加失败！当前会话内不存在名为 [{server_name}] 的服务器"
+            )
+            return
+        if error == "AMBIGUOUS_SERVER_NAME":
+            yield event.plain_result(
+                f"备用线路添加失败！检测到多个同名服务器 [{server_name}]"
+            )
+            return
+        if error == "INVALID_ADDRESS":
+            yield event.plain_result(
+                "备用线路添加失败！地址无效或指向内网/保留网络"
+            )
+            return
+        if error == "CONNECTION_TIMEOUT":
+            yield event.plain_result("备用线路添加失败！服务器连接超时")
+            return
+        if error == "CONNECTION_FAILED":
+            yield event.plain_result("备用线路添加失败！服务器连接失败")
+            return
+        if error == "SERVER_ADDRESS_ALREADY_EXISTS":
+            yield event.plain_result("备用线路添加失败！该地址已被当前会话使用")
+            return
+        if error == "SAVE_FAILED":
+            yield event.plain_result("备用线路添加失败！服务器保存失败，请稍后重试")
+            return
+        if not result.get("ok"):
+            yield event.plain_result("备用线路添加失败！")
+            return
+
+        final_name = str(result.get("server", server_name))
+        final_address = str(result.get("address", raw_address))
+        yield event.plain_result(
+            f"备用线路添加成功！服务器 [{final_name}] 已添加备用地址 [{final_address}]"
+        )
 
     @filter.regex(r"^/(?:查询服务器|查询)(?:\s+\S+)?\s*$")
     async def query_server(self, event: AstrMessageEvent):
@@ -594,6 +661,7 @@ class Main(Star):
         # 合法命令留给专用 handler 处理；仅兜底错误格式。
         valid_patterns = (
             ADD_SERVER_PATTERN,
+            BACKUP_SERVER_PATTERN,
             QUERY_SERVER_PATTERN,
             DELETE_SERVER_PATTERN,
             CLEAR_DATA_PATTERN,
@@ -762,6 +830,37 @@ class Main(Star):
             )
         except Exception as exc:
             return self._tool_internal_error("add_mc_server", exc)
+
+    @filter.llm_tool(name="add_mc_server_backup")
+    async def add_mc_server_backup_tool(
+        self,
+        event: AstrMessageEvent,
+        server: str,
+        address: str,
+    ) -> dict[str, Any]:
+        """为当前会话中已保存的 Minecraft 服务器添加备用线路。
+
+        当用户要求为一个已保存服务器添加备用、备选或故障转移地址时调用。
+        添加前会验证新地址可连接。群聊仅管理员可用，私聊不要求管理员权限。
+
+        Args:
+            server(string): 当前会话中已保存的服务器名称，例如：生存服。
+            address(string): 与会话内所有已保存线路不同的新地址，例如：backup.example.com:25565。
+        """
+        if self._is_group_admin_denied(event):
+            return self._tool_permission_denied()
+        rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
+        if rate_limited:
+            return rate_limited
+        try:
+            result = await self._add_backup_server_data(
+                event.unified_msg_origin,
+                server,
+                address,
+            )
+            return self._with_tool_meta(result)
+        except Exception as exc:
+            return self._tool_internal_error("add_mc_server_backup", exc)
 
     @filter.llm_tool(name="delete_mc_server")
     async def delete_mc_server_tool(
@@ -1362,10 +1461,16 @@ class Main(Star):
             store = await self._load_store()
             session_obj = self._get_or_create_session(store, session_key)
             existing_servers: dict[str, dict[str, Any]] = session_obj["servers"]
-            if address in existing_servers:
+            existing_primary = _store_mod.find_server_primary_by_line(
+                existing_servers,
+                address,
+            )
+            if existing_primary is not None:
                 return {
                     "ok": False,
-                    "server": str(existing_servers[address].get("name", desired_name)),
+                    "server": str(
+                        existing_servers[existing_primary].get("name", desired_name)
+                    ),
                     "address": address,
                     "error": "SERVER_ALREADY_EXISTS",
                     "message": "server already exists",
@@ -1411,10 +1516,11 @@ class Main(Star):
             store = await self._load_store()
             session_obj = self._get_or_create_session(store, session_key)
             servers: dict[str, dict[str, Any]] = session_obj["servers"]
-            if address in servers:
+            existing_primary = _store_mod.find_server_primary_by_line(servers, address)
+            if existing_primary is not None:
                 return {
                     "ok": False,
-                    "server": str(servers[address].get("name", desired_name)),
+                    "server": str(servers[existing_primary].get("name", desired_name)),
                     "address": address,
                     "error": "SERVER_ALREADY_EXISTS",
                     "message": "server already exists",
@@ -1437,6 +1543,7 @@ class Main(Star):
             servers[address] = {
                 "name": final_name,
                 "address": address,
+                "backup_addresses": [],
                 "latency_history": [],
                 "last_latency": status.latency,
                 "motd": str(status.motd or ""),
@@ -1475,6 +1582,162 @@ class Main(Star):
             "motd": status.motd,
         }
 
+    async def _add_backup_server_data(
+        self,
+        session_key: str,
+        server_name: str,
+        raw_address: str,
+    ) -> dict[str, Any]:
+        """Validate and append an ordered backup line to a saved server."""
+        server_name = (server_name or "").strip()
+        raw_address = (raw_address or "").strip()
+        if not server_name or not raw_address:
+            return {
+                "ok": False,
+                "error": "INVALID_ARGUMENT",
+                "message": "server and address are required",
+            }
+        if not self.auto_append_default_port and self._has_invalid_port_segment(
+            raw_address
+        ):
+            return {
+                "ok": False,
+                "server": server_name,
+                "address": raw_address,
+                "error": "INVALID_ADDRESS",
+                "message": "server address port is invalid",
+            }
+
+        address = self._normalize_address(raw_address)
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers: dict[str, dict[str, Any]] = session_obj["servers"]
+            matched = self._find_server_addresses_by_name(servers, server_name)
+            if not matched:
+                return {
+                    "ok": False,
+                    "server": server_name,
+                    "address": address,
+                    "error": "SERVER_NOT_FOUND",
+                    "message": "saved server not found in current session",
+                }
+            if len(matched) > 1:
+                return {
+                    "ok": False,
+                    "server": server_name,
+                    "address": address,
+                    "error": "AMBIGUOUS_SERVER_NAME",
+                    "message": "multiple saved servers use this name",
+                }
+            primary_address = matched[0]
+            if _store_mod.is_server_line_address_in_use(servers, address):
+                return {
+                    "ok": False,
+                    "server": server_name,
+                    "primary_address": primary_address,
+                    "address": address,
+                    "error": "SERVER_ADDRESS_ALREADY_EXISTS",
+                    "message": "address already belongs to a saved server line",
+                }
+
+        try:
+            status = await self._fetch_server_status(address, need_players=False)
+        except McServerInvalidAddressError:
+            return {
+                "ok": False,
+                "server": server_name,
+                "address": address,
+                "error": "INVALID_ADDRESS",
+                "message": "server address must resolve to public IP addresses",
+            }
+        except McServerTimeoutError:
+            return {
+                "ok": False,
+                "server": server_name,
+                "address": address,
+                "error": "CONNECTION_TIMEOUT",
+                "message": "server connection timed out",
+            }
+        except McServerConnectionError:
+            return {
+                "ok": False,
+                "server": server_name,
+                "address": address,
+                "error": "CONNECTION_FAILED",
+                "message": "server connection failed",
+            }
+
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(store, session_key)
+            servers = session_obj["servers"]
+            matched = self._find_server_addresses_by_name(servers, server_name)
+            if not matched:
+                return {
+                    "ok": False,
+                    "server": server_name,
+                    "address": address,
+                    "error": "SERVER_NOT_FOUND",
+                    "message": "saved server was removed during validation",
+                }
+            if len(matched) > 1:
+                return {
+                    "ok": False,
+                    "server": server_name,
+                    "address": address,
+                    "error": "AMBIGUOUS_SERVER_NAME",
+                    "message": "multiple saved servers use this name",
+                }
+            primary_address = matched[0]
+            if _store_mod.is_server_line_address_in_use(servers, address):
+                return {
+                    "ok": False,
+                    "server": server_name,
+                    "primary_address": primary_address,
+                    "address": address,
+                    "error": "SERVER_ADDRESS_ALREADY_EXISTS",
+                    "message": "address already belongs to a saved server line",
+                }
+
+            server_obj = servers[primary_address]
+            backup_addresses = list(server_obj.get("backup_addresses", []))
+            backup_addresses.append(address)
+            server_obj["backup_addresses"] = backup_addresses
+            server_obj["last_latency"] = status.latency
+            server_obj["motd"] = str(status.motd or "")
+            final_name = str(server_obj.get("name", server_name) or server_name)
+            try:
+                await self._save_store(store)
+            except Exception as exc:
+                logger.exception("save backup server line failed: %s", exc)
+                return {
+                    "ok": False,
+                    "server": final_name,
+                    "primary_address": primary_address,
+                    "address": address,
+                    "error": "SAVE_FAILED",
+                    "message": "server save failed",
+                }
+
+        self._clear_query_render_cache(session_key, primary_address)
+        self._clear_tool_status_cache(session_key)
+        self._clear_tool_list_cache(session_key)
+        await self._cache_server_icon(address, status.icon_base64)
+        await self._cleanup_expired_cache()
+        return {
+            "ok": True,
+            "server": final_name,
+            "primary_address": primary_address,
+            "address": address,
+            "line_type": "backup",
+            "latency": status.latency,
+            "players_online": status.players_online,
+            "players_max": status.players_max,
+            "version": status.version,
+            "motd": status.motd,
+        }
+
     async def _delete_server_data(
         self, session_key: str, server: str, *, idempotent: bool = False
     ) -> dict[str, Any]:
@@ -1491,13 +1754,17 @@ class Main(Star):
             store = await self._load_store()
             session_obj = self._get_or_create_session(store, session_key)
             servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
-            addresses = self._find_server_addresses_by_name(servers, target)
-            if not addresses:
+            primary_addresses = self._find_server_addresses_by_name(servers, target)
+            if not primary_addresses:
                 # 名称未命中时按规范化地址匹配（补全默认端口后与存储键对齐）
                 normalized_target = self._normalize_address(target)
-                if normalized_target in servers:
-                    addresses = [normalized_target]
-            if not addresses:
+                matched_primary = _store_mod.find_server_primary_by_line(
+                    servers,
+                    normalized_target,
+                )
+                if matched_primary is not None:
+                    primary_addresses = [matched_primary]
+            if not primary_addresses:
                 if idempotent:
                     return {
                         "ok": True,
@@ -1513,7 +1780,7 @@ class Main(Star):
                     "error": "SERVER_NOT_FOUND",
                     "message": "saved server not found in current session",
                 }
-            if len(addresses) > 1:
+            if len(primary_addresses) > 1:
                 return {
                     "ok": False,
                     "server": target,
@@ -1522,13 +1789,20 @@ class Main(Star):
                 }
 
             removed: list[dict[str, Any]] = []
-            for address in addresses:
-                server_obj = servers.pop(address, None)
+            removed_line_addresses: list[str] = []
+            for primary_address in primary_addresses:
+                server_obj = servers.pop(primary_address, None)
                 if server_obj:
+                    line_addresses = _store_mod.get_server_line_addresses(
+                        primary_address,
+                        server_obj,
+                    )
+                    removed_line_addresses.extend(line_addresses)
                     removed.append(
                         {
                             "name": str(server_obj.get("name", target)),
-                            "address": address,
+                            "address": primary_address,
+                            "backup_addresses": line_addresses[1:],
                         }
                     )
             try:
@@ -1543,8 +1817,9 @@ class Main(Star):
                 }
             referenced_addresses = self._collect_referenced_addresses(store)
 
-        for address in addresses:
-            self._clear_query_render_cache(session_key, address)
+        for primary_address in primary_addresses:
+            self._clear_query_render_cache(session_key, primary_address)
+        for address in removed_line_addresses:
             if address not in referenced_addresses:
                 self._delete_server_cache(address)
         self._clear_tool_status_cache(session_key)
@@ -1563,7 +1838,8 @@ class Main(Star):
             store = await self._load_store()
             session_obj = self._get_or_create_session(store, session_key)
             servers: dict[str, dict[str, Any]] = session_obj.get("servers", {})
-            addresses = list(servers)
+            removed_count = len(servers)
+            addresses = _store_mod.get_session_server_addresses(servers)
 
             if addresses:
                 session_obj["servers"] = {}
@@ -1602,8 +1878,8 @@ class Main(Star):
 
         return {
             "ok": True,
-            "removed_count": len(addresses),
-            "already_empty": not addresses,
+            "removed_count": removed_count,
+            "already_empty": removed_count == 0,
         }
 
     async def _rename_server_data(
@@ -1729,6 +2005,17 @@ class Main(Star):
                     "message": f"multiple saved servers use name '{server_name}'",
                 }
             old_address = matched[0]
+            if _store_mod.is_server_line_address_in_use(
+                servers,
+                new_address,
+                exclude_primary=old_address,
+            ):
+                return {
+                    "ok": False,
+                    "server_name": server_name,
+                    "error": "SERVER_ALREADY_EXISTS",
+                    "message": "new address already belongs to a saved server line",
+                }
 
         # 2) 锁外验证新地址（网络 I/O，不阻塞其他操作）
         try:
@@ -1772,13 +2059,16 @@ class Main(Star):
                 }
 
             # 地址冲突检测
-            if new_address != old_address and new_address in servers:
-                conflict_name = servers[new_address].get("name", new_address)
+            if _store_mod.is_server_line_address_in_use(
+                servers,
+                new_address,
+                exclude_primary=old_address,
+            ):
                 return {
                     "ok": False,
                     "server_name": server_name,
                     "error": "SERVER_ALREADY_EXISTS",
-                    "message": f"new address already used by '{conflict_name}'",
+                    "message": "new address already belongs to a saved server line",
                 }
 
             moved_server = dict(current_server)
@@ -1797,10 +2087,15 @@ class Main(Star):
                     "error": "SAVE_FAILED",
                     "message": "server save failed",
                 }
+            referenced_addresses = self._collect_referenced_addresses(store)
 
         self._clear_tool_status_cache(session_key)
         self._clear_tool_list_cache(session_key)
         self._clear_query_render_cache(session_key, old_address)
+        self._clear_query_render_cache(session_key, new_address)
+        await self._cache_server_icon(new_address, status.icon_base64)
+        if old_address != new_address and old_address not in referenced_addresses:
+            self._delete_server_cache(old_address)
         return {
             "ok": True,
             "server_name": moved_server.get("name", server_name),
@@ -2429,14 +2724,20 @@ class Main(Star):
                 servers = session_obj.get("servers", {})
                 if not isinstance(servers, dict):
                     continue
-                for address, server_obj in servers.items():
-                    if not isinstance(address, str) or not isinstance(server_obj, dict):
+                for primary_address, server_obj in servers.items():
+                    if not isinstance(primary_address, str) or not isinstance(
+                        server_obj, dict
+                    ):
                         continue
-                    current = session_server_map.get(address)
-                    if current is None or self._server_last_touch(
-                        server_obj
-                    ) > self._server_last_touch(current):
-                        session_server_map[address] = server_obj
+                    for address in _store_mod.get_server_line_addresses(
+                        primary_address,
+                        server_obj,
+                    ):
+                        current = session_server_map.get(address)
+                        if current is None or self._server_last_touch(
+                            server_obj
+                        ) > self._server_last_touch(current):
+                            session_server_map[address] = server_obj
 
         for address, server_obj in session_server_map.items():
             cache_dir = self._server_cache_dir(address)
@@ -2517,7 +2818,12 @@ class Main(Star):
             servers = session_obj.get("servers", {})
             if not isinstance(servers, dict):
                 continue
-            addresses.update(address for address in servers if isinstance(address, str))
+            typed_servers = {
+                address: server_obj
+                for address, server_obj in servers.items()
+                if isinstance(address, str) and isinstance(server_obj, dict)
+            }
+            addresses.update(_store_mod.get_session_server_addresses(typed_servers))
         return addresses
 
     async def _load_store(self) -> dict[str, Any]:
@@ -2877,6 +3183,9 @@ class Main(Star):
             "命令用法：\n"
             "/添加服务器 <服务器名称> <服务器地址>\n"
             "/添加 <服务器名称> <服务器地址>\n"
+            "/备用线路 <服务器名称> <备用地址>\n"
+            "/备用 <服务器名称> <备用地址>\n"
+            "/bak <服务器名称> <备用地址>\n"
             "/查询服务器 [服务器名称|服务器地址]\n"
             "/查询 [服务器名称|服务器地址]\n"
             "/删除服务器 <服务器名称>\n"
