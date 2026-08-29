@@ -90,15 +90,20 @@ def make_status(
     latency: int = 47,
     *,
     motd: str = "hello",
+    players: list[dict[str, str]] | None = None,
+    icon_base64: str | None = None,
+    players_online: int = 2,
+    players_max: int = 20,
+    version: str = "1.21.4",
 ) -> ServerStatus:
     return ServerStatus(
         address=address,
         latency=latency,
-        version="1.21.4",
-        players_online=2,
-        players_max=20,
-        icon_base64=None,
-        players=[],
+        version=version,
+        players_online=players_online,
+        players_max=players_max,
+        icon_base64=icon_base64,
+        players=list(players or []),
         motd=motd,
     )
 

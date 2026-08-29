@@ -440,10 +440,7 @@ class Main(Star):
             )
             return
 
-        summary, failures = await self._query_all_servers(event)
-        messages_to_send = failures + [summary]
-        final_message = "\n".join(messages_to_send)
-        yield event.plain_result(final_message)
+        yield await self._query_all_servers(event)
 
     @filter.regex(r"^/模板(?:\s+\S+)?\s*$")
     async def switch_template(self, event: AstrMessageEvent):
@@ -2632,73 +2629,126 @@ class Main(Star):
         self._set_query_render_cache(cache_key, image_b64)
         return event.make_result().base64_image(image_b64)
 
-    async def _query_all_servers(
-        self, event: AstrMessageEvent
-    ) -> tuple[str, list[str]]:
-        """主动查询当前会话下全部服务器。
-
-        Returns:
-            tuple[str, list[str]]:
-            - summary: 汇总文本（多行）
-            - failures: 失败提示列表（按需求单独回传）
-        """
+    async def _query_all_servers(self, event: AstrMessageEvent):
+        """Query all logical servers and render one combined image."""
         session_key = event.unified_msg_origin
         async with self._store_lock:
             store = await self._load_store()
             session_obj = self._get_or_create_session(store, session_key)
             servers: dict[str, dict[str, Any]] = dict(session_obj["servers"])
+            template_name = str(
+                session_obj.get("template", DEFAULT_TEMPLATE_NAME)
+                or DEFAULT_TEMPLATE_NAME
+            )
 
         if not servers:
-            return "当前会话暂无已添加服务器", []
+            return event.plain_result("当前会话暂无已添加服务器")
 
-        results: list[str] = []
-        failures: list[str] = []
-        now = int(time.time())
         semaphore = asyncio.Semaphore(self.query_all_concurrency)
 
-        async def _query_one(address: str, server_obj: dict[str, Any]):
+        async def _query_one(
+            primary_address: str,
+            server_obj: dict[str, Any],
+        ) -> tuple[
+            str,
+            dict[str, Any],
+            SavedServerQueryResult,
+            list[dict[str, str]],
+        ]:
             async with semaphore:
-                server_name = str(server_obj.get("name", address) or address)
-                try:
-                    status = await self._fetch_server_status(
-                        address, need_players=False
+                query_result = await self._query_saved_server_lines(
+                    primary_address,
+                    server_obj,
+                    need_players=True,
+                )
+                players_for_render: list[dict[str, str]] = []
+                if query_result.status is not None:
+                    await self._cache_server_icon(
+                        query_result.address,
+                        query_result.status.icon_base64,
                     )
-                    return address, server_obj, status, None
-                except Exception:
-                    return (
-                        address,
-                        server_obj,
-                        None,
-                        f"服务器 [{server_name}] 查询失败！",
+                    players_for_render = (
+                        await self._cache_and_collect_player_avatars(
+                            query_result.address,
+                            query_result.status.players,
+                        )
                     )
+                return (
+                    primary_address,
+                    server_obj,
+                    query_result,
+                    players_for_render,
+                )
 
         queried = await asyncio.gather(
             *[
-                _query_one(address, server_obj)
-                for address, server_obj in servers.items()
+                _query_one(primary_address, server_obj)
+                for primary_address, server_obj in servers.items()
             ]
         )
 
+        entries: list[dict[str, Any]] = []
         successful_status: dict[str, ServerStatus] = {}
-        for address, server_obj, status, fail_msg in queried:
-            if fail_msg:
-                failures.append(fail_msg)
-                continue
-            assert status is not None
-            successful_status[address] = status
-            server_name = str(server_obj.get("name", address) or address)
-            results.append(
-                f"{server_name}: 延迟 : {status.latency}ms | 玩家人数 : {status.players_online}/{status.players_max}"
+        for (
+            primary_address,
+            server_obj,
+            query_result,
+            players_for_render,
+        ) in queried:
+            server_name = str(
+                server_obj.get("name", primary_address) or primary_address
             )
-            await self._cache_server_icon(address, status.icon_base64)
+            status = query_result.status
+            if status is None:
+                icon_path = self._find_cached_server_icon(
+                    primary_address,
+                    server_obj,
+                )
+                entries.append(
+                    {
+                        "name": server_name,
+                        "primary_address": primary_address,
+                        "address": primary_address,
+                        "line_type": "primary",
+                        "attempted_addresses": query_result.attempted_addresses,
+                        "latency": 0,
+                        "players_online": 0,
+                        "players_max": 0,
+                        "version": "Unknown",
+                        "icon_path": (
+                            str(icon_path) if icon_path is not None else None
+                        ),
+                        "players": [],
+                        "offline": True,
+                    }
+                )
+                continue
+            successful_status[primary_address] = status
+            icon_path = self._icon_cache_path(query_result.address)
+            entries.append(
+                {
+                    "name": server_name,
+                    "primary_address": primary_address,
+                    "address": query_result.address,
+                    "line_type": query_result.line_type,
+                    "attempted_addresses": query_result.attempted_addresses,
+                    "latency": status.latency,
+                    "players_online": status.players_online,
+                    "players_max": status.players_max,
+                    "version": status.version,
+                    "icon_path": str(icon_path) if icon_path.is_file() else None,
+                    "players": players_for_render,
+                    "offline": False,
+                }
+            )
 
-        # 单次合并写入，减少高频全量写
+        now = int(time.time())
         if successful_status:
             async with self._store_lock:
                 store = await self._load_store()
                 session_obj = self._get_or_create_session(store, session_key)
-                for address, status in successful_status.items():
-                    real_server_obj = session_obj["servers"].get(address)
+                for primary_address, status in successful_status.items():
+                    real_server_obj = session_obj["servers"].get(primary_address)
                     if not real_server_obj:
                         continue
                     real_server_obj["last_latency"] = status.latency
@@ -2706,10 +2756,18 @@ class Main(Star):
                     real_server_obj["motd"] = str(status.motd or "")
                     self._append_latency(real_server_obj, status.latency, now)
                 await self._save_store(store)
+            self._clear_tool_list_cache(session_key)
+            for primary_address in successful_status:
+                self._clear_query_render_cache(session_key, primary_address)
 
         await self._cleanup_expired_cache()
-        output = "\n".join(results) if results else "本次无可用服务器结果"
-        return output, failures
+        renderer = await self._get_template_renderer(template_name, mode="list")
+        image_b64 = await self._call_template_renderer(
+            renderer,
+            mode="query_all",
+            servers=entries,
+        )
+        return event.make_result().base64_image(image_b64)
 
     async def _silent_query_loop(self) -> None:
         """静默轮询主循环。
