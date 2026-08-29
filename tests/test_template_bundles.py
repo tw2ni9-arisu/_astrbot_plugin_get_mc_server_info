@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -218,6 +221,55 @@ class TemplateBundleLoadingTests(unittest.IsolatedAsyncioTestCase):
                     root,
                     {},
                 )
+
+
+class TemplateProductionNamespaceTests(unittest.TestCase):
+    def test_builtin_list_renderers_load_under_data_plugins_namespace(self) -> None:
+        package_root = PLUGIN_ROOT.parents[2]
+        script = textwrap.dedent(
+            f"""
+            import asyncio
+            import importlib.util
+            import sys
+            from pathlib import Path
+
+            sys.path.insert(0, {str(package_root)!r})
+            assert importlib.util.find_spec(
+                "astrbot_plugin_get_mc_server_info"
+            ) is None
+
+            from data.plugins.astrbot_plugin_get_mc_server_info import template_loader
+
+            async def main():
+                cache = {{}}
+                templates_dir = Path({str(PLUGIN_ROOT / "templates")!r})
+                for template_name in ("default_method", "terminal_method"):
+                    renderer = await template_loader.get_template_renderer(
+                        template_name,
+                        "list",
+                        templates_dir,
+                        cache,
+                    )
+                    assert renderer.__name__ == "render_server_list_image"
+
+            asyncio.run(main())
+            """
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", script],
+            cwd=PLUGIN_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
 
 if __name__ == "__main__":

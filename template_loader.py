@@ -129,10 +129,22 @@ async def get_template_renderer(
         if cached_mtime == current_mtime:
             return cached_renderer
 
-    module_name = (
-        "astrbot_plugin_get_mc_server_info_template_"
-        f"{template_name}_{mode}_{template_file.stat().st_mtime_ns}"
-    )
+    packaged_templates_dir = Path(__file__).resolve().parent / "templates"
+    if (
+        __package__
+        and template_file.parent.parent.resolve() == packaged_templates_dir.resolve()
+        and template_file.parent.name.isidentifier()
+    ):
+        module_name = (
+            f"{__package__}.templates.{template_file.parent.name}."
+            f"_astrbot_dynamic_{template_file.stem}_"
+            f"{template_file.stat().st_mtime_ns}"
+        )
+    else:
+        module_name = (
+            "astrbot_plugin_get_mc_server_info_template_"
+            f"{template_name}_{mode}_{template_file.stat().st_mtime_ns}"
+        )
     spec = importlib.util.spec_from_file_location(module_name, template_file)
     if not spec or not spec.loader:
         raise RuntimeError("cannot build module spec")

@@ -10,7 +10,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from astrbot_plugin_get_mc_server_info.templates.default_method.default_method_query import (
+from .default_method_query import (
     BAD_COLOR,
     BG,
     CARD_ALPHA,
