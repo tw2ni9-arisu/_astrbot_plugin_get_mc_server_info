@@ -95,6 +95,15 @@ def _format_latency(entry: dict[str, Any]) -> tuple[str, tuple[int, int, int]]:
     return f"{latency}ms", _latency_color(latency)
 
 
+def _display_address(entry: dict[str, Any], mode: str) -> str:
+    """Select the logical primary for lists and the responding line for queries."""
+    if mode == "query_all":
+        value = entry.get("address") or entry.get("primary_address")
+    else:
+        value = entry.get("primary_address") or entry.get("address")
+    return str(value or "")
+
+
 def _load_avatar(path_value: Any) -> Image.Image:
     path = Path(str(path_value or ""))
     if path_value and path.is_file():
@@ -142,7 +151,7 @@ def _draw_header(
     )
     address = _truncate_text(
         draw,
-        str(entry.get("primary_address") or entry.get("address") or ""),
+        _display_address(entry, mode),
         detail_font,
         max(metrics_start - text_x - 18, 80),
     )
@@ -274,7 +283,11 @@ def _render_server_list_image_sync(
     entries = [entry for entry in servers if isinstance(entry, dict)]
     width = max(int(canvas_width), 480)
     height = _canvas_height(entries, mode)
-    background = _load_template_background(width, height)
+    background = _load_template_background(
+        width,
+        height,
+        centering=(0.5, 0.0),
+    )
     image = background or Image.new("RGBA", (width, height), BG)
     image = image.convert("RGBA")
 

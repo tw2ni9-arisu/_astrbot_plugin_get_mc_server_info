@@ -4,6 +4,7 @@ import base64
 import io
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -13,6 +14,8 @@ from astrbot_plugin_get_mc_server_info.templates.default_method.default_method_l
     CARD_GAP,
     OUTER_PADDING,
     _card_height,
+    _display_address,
+    _render_server_list_image_sync,
     render_server_list_image,
 )
 from astrbot_plugin_get_mc_server_info.templates.terminal_method.terminal_method_list import (
@@ -97,6 +100,33 @@ class ListRendererGeometryTests(unittest.IsolatedAsyncioTestCase):
             + _card_height(empty, "query_all")
         )
         self.assertEqual(image.height, expected_height)
+
+    def test_header_address_uses_the_line_relevant_to_each_mode(self) -> None:
+        entry = make_list_entry("online")
+        entry["address"] = "backup.example.com:25565"
+        entry["line_type"] = "backup"
+
+        self.assertEqual(
+            _display_address(entry, "list"),
+            entry["primary_address"],
+        )
+        self.assertEqual(
+            _display_address(entry, "query_all"),
+            entry["address"],
+        )
+
+    def test_list_background_is_top_aligned_to_match_reference(self) -> None:
+        loader_path = (
+            "astrbot_plugin_get_mc_server_info.templates.default_method."
+            "default_method_list._load_template_background"
+        )
+        with patch(loader_path, return_value=None) as load_background:
+            _render_server_list_image_sync(
+                mode="list",
+                servers=[make_list_entry("one")],
+            )
+
+        self.assertEqual(load_background.call_args.kwargs["centering"], (0.5, 0.0))
 
     async def test_terminal_adapter_reuses_renderer_at_1100_pixels(self) -> None:
         encoded = await terminal_render(

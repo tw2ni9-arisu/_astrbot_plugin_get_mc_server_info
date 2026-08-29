@@ -1,5 +1,5 @@
-"""Template package for renderer modules.
+"""Directory-based query/list renderer bundles.
 
-Each template module should export:
-    async def render_server_report_image(...)
+Query modules export ``render_server_report_image`` and list modules export
+``render_server_list_image``.
 """

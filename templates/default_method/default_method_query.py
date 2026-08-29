@@ -94,7 +94,12 @@ def _server_icon(icon_path: str | None) -> Image.Image:
     return icon
 
 
-def _load_template_background(width: int, height: int) -> Image.Image | None:
+def _load_template_background(
+    width: int,
+    height: int,
+    *,
+    centering: tuple[float, float] = (0.5, 0.5),
+) -> Image.Image | None:
     template_file = Path(__file__).resolve()
     stem = template_file.stem.removesuffix("_query")
     parent = template_file.parent
@@ -102,7 +107,12 @@ def _load_template_background(width: int, height: int) -> Image.Image | None:
     if candidate is not None:
         try:
             img = Image.open(candidate).convert("RGBA")
-            return ImageOps.fit(img, (width, height), method=Image.Resampling.LANCZOS)
+            return ImageOps.fit(
+                img,
+                (width, height),
+                method=Image.Resampling.LANCZOS,
+                centering=centering,
+            )
         except OSError:
             pass
     return None

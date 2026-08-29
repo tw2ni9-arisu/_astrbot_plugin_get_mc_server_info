@@ -7,7 +7,7 @@
 4. 图标/皮肤/头像资源的缓存生命周期管理。
 5. 图片渲染的模板分发。
 
-渲染细节委托给 `templates/default_method.py`。
+渲染细节委托给 `templates/*/*_query.py` 与 `templates/*/*_list.py`。
 持久化数据通过插件 KV 存储（`get_kv_data` / `put_kv_data`）。
 """
 
@@ -60,10 +60,10 @@ TEMPLATE_PATTERN = re.compile(r"^/模板(?:\s+(\S+))?\s*$")
 TEMPLATE_RELOAD_PATTERN = re.compile(r"^/模板重载\s*$")
 REDIRECT_SERVER_PATTERN = re.compile(r"^/重定向\s+(\S+)\s+(\S+)\s*$")
 HELP_PATTERN = re.compile(r"^/(?:帮助|help)\s*$")
-COMMAND_FALLBACK_PATTERN = re.compile(
-    r"^/(?:添加服务器|添加|备用线路|备用|bak|查询服务器|查询|删除服务器|删除|数据清除|重命名服务器|重命名|重定向|服务器列表|列表|模板重载|模板|帮助|help)(?:\s+.*)?$",
-    re.IGNORECASE,
+COMMAND_FALLBACK_REGEX = (
+    r"(?i)^/(?:添加服务器|添加|备用线路|备用|bak|查询服务器|查询|删除服务器|删除|数据清除|重命名服务器|重命名|重定向|服务器列表|列表|模板重载|模板|帮助|help)(?:\s+.*)?$"
 )
+COMMAND_FALLBACK_PATTERN = re.compile(COMMAND_FALLBACK_REGEX)
 
 # 是否自动补全默认端口（可被插件配置覆盖）
 AUTO_APPEND_DEFAULT_PORT = False
@@ -78,7 +78,7 @@ HISTORY_LIMIT = 48
 CACHE_TTL_SECONDS = 24 * 60 * 60
 # 向 MC 服务端拉取状态的超时
 STATUS_TIMEOUT = 10
-# 默认渲染模板（对应 templates/default_method.py）
+# 默认渲染模板（对应 templates/default_method/ 目录）
 DEFAULT_TEMPLATE_NAME = "default_method"
 # 离线服务器没有实时 Motd 时使用的默认文本
 DEFAULT_OFFLINE_MOTD = "邦邦咔邦"
@@ -101,7 +101,7 @@ QUERY_RESULT_CACHE_TTL_SECONDS = 10
 QUERY_CACHE_CLEANUP_INTERVAL_SECONDS = 5 * 60
 # LLM Tool 返回结构版本
 TOOL_VERSION = "1.2"
-PLUGIN_VERSION = "v1.9.3"
+PLUGIN_VERSION = "v2.0.1"
 # Tool 查询状态缓存，避免 Agent 连续追问时重复打到 MC 服务端
 TOOL_STATUS_CACHE_TTL_SECONDS = 30
 # Tool 列表缓存，避免 Agent 连续追问列表细节时重复读取存储
@@ -693,9 +693,7 @@ class Main(Star):
         )
         yield event.make_result().base64_image(image_b64)
 
-    @filter.regex(
-        r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|数据清除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
-    )
+    @filter.regex(COMMAND_FALLBACK_REGEX)
     async def command_help_and_format_guard(self, event: AstrMessageEvent):
         """命令帮助与格式兜底。"""
         if self._should_ignore_self_event(event):
