@@ -634,24 +634,67 @@ class Main(Star):
             yield event.plain_result(self._build_help_message())
             return
 
-        servers = await self._list_servers_data(event.unified_msg_origin)
+        async with self._store_lock:
+            store = await self._load_store()
+            session_obj = self._get_or_create_session(
+                store,
+                event.unified_msg_origin,
+            )
+            template_name = str(
+                session_obj.get("template", DEFAULT_TEMPLATE_NAME)
+                or DEFAULT_TEMPLATE_NAME
+            )
+            servers: dict[str, dict[str, Any]] = dict(
+                session_obj.get("servers", {})
+            )
         if not servers:
             yield event.plain_result("当前会话暂无已添加服务器")
             return
 
-        lines: list[str] = []
-        for index, server_obj in enumerate(servers, start=1):
-            name = str(server_obj.get("name", "Unknown"))
-            address = str(server_obj.get("address", "Unknown"))
+        entries: list[dict[str, Any]] = []
+        for primary_address, server_obj in servers.items():
             try:
-                last_latency = int(server_obj.get("latency", 0) or 0)
+                last_latency = int(server_obj.get("last_latency", 0) or 0)
             except Exception:
                 last_latency = 0
-            lines.append(
-                f"{index}. {name} : {address} | 最近延迟 : {max(last_latency, 0)}ms"
+            line_addresses = _store_mod.get_server_line_addresses(
+                primary_address,
+                server_obj,
+            )
+            icon_path = self._find_cached_server_icon(
+                primary_address,
+                server_obj,
+            )
+            entries.append(
+                {
+                    "name": str(server_obj.get("name", primary_address)),
+                    "primary_address": primary_address,
+                    "address": primary_address,
+                    "line_type": "primary",
+                    "latency": max(last_latency, 0),
+                    "players_online": server_obj.get("players_online"),
+                    "players_max": server_obj.get("players_max"),
+                    "version": str(server_obj.get("version", "") or ""),
+                    "offline": last_latency <= 0,
+                    "icon_path": str(icon_path) if icon_path is not None else None,
+                    "lines": [
+                        {
+                            "address": line_address,
+                            "line_type": "primary" if index == 0 else "backup",
+                        }
+                        for index, line_address in enumerate(line_addresses)
+                    ],
+                    "players": [],
+                }
             )
 
-        yield event.plain_result("\n".join(lines))
+        renderer = await self._get_template_renderer(template_name, mode="list")
+        image_b64 = await self._call_template_renderer(
+            renderer,
+            mode="list",
+            servers=entries,
+        )
+        yield event.make_result().base64_image(image_b64)
 
     @filter.regex(
         r"^/(?:添加服务器|添加|查询服务器|查询|删除服务器|删除|数据清除|重命名服务器|重命名|重定向|服务器列表|列表|模板|帮助|help)(?:\s+.*)?$"
@@ -2174,15 +2217,28 @@ class Main(Star):
             servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
 
         results: list[dict[str, Any]] = []
-        for server_obj in servers.values():
+        for primary_address, server_obj in servers.items():
             try:
                 last_latency = int(server_obj.get("last_latency", 0) or 0)
             except Exception:
                 last_latency = 0
+            line_addresses = _store_mod.get_server_line_addresses(
+                primary_address,
+                server_obj,
+            )
             results.append(
                 {
                     "name": str(server_obj.get("name", "Unknown")),
-                    "address": str(server_obj.get("address", "Unknown")),
+                    "address": primary_address,
+                    "primary_address": primary_address,
+                    "backup_addresses": line_addresses[1:],
+                    "lines": [
+                        {
+                            "address": line_address,
+                            "line_type": "primary" if index == 0 else "backup",
+                        }
+                        for index, line_address in enumerate(line_addresses)
+                    ],
                     "latency": max(last_latency, 0),
                 }
             )
