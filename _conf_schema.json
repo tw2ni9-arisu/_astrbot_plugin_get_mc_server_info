@@ -1,92 +1,178 @@
 {
   "silent_query_interval_seconds": {
     "type": "int",
-    "description": "Interval between background silent polling rounds (seconds).",
-    "hint": "Default 1800 (30 minutes). Range 60-604800.",
+    "description": "后台静默轮询的间隔时间（秒）。",
+    "hint": "默认 1800 秒（30 分钟），可填写 60 至 604800。",
     "default": 1800
   },
   "history_limit": {
     "type": "int",
-    "description": "Max retained latency history points per server.",
-    "hint": "Default 48 (about 24h if poll interval is 30m). Range 1-2048.",
+    "description": "每台服务器最多保留的延迟历史点数。",
+    "hint": "默认 48；当轮询间隔为 30 分钟时约对应 24 小时，可填写 1 至 2048。",
     "default": 48
   },
   "cache_ttl_seconds": {
     "type": "int",
-    "description": "TTL for cached icon/avatar files (seconds).",
-    "hint": "Default 86400 (24 hours). Range 60-2592000.",
+    "description": "服务器图标和玩家头像缓存的有效时间（秒）。",
+    "hint": "默认 86400 秒（24 小时），可填写 60 至 2592000。",
     "default": 86400
   },
   "status_timeout_seconds": {
     "type": "int",
-    "description": "Timeout for a single MC status request (seconds).",
-    "hint": "Default 10. Range 1-60 and covers lookup, DNS, status, and ping.",
+    "description": "单次 Minecraft 服务器状态查询的超时时间（秒）。",
+    "hint": "默认 10 秒，可填写 1 至 60；包含地址解析、DNS、状态查询和延迟检测。",
     "default": 10
   },
   "auto_append_default_port": {
     "type": "bool",
-    "description": "Whether to append default port 25565 when address has no valid port.",
-    "hint": "Default false. Applies to '/添加服务器' and '/查询服务器 <服务器地址>'.",
+    "description": "服务器地址没有有效端口时，是否自动补全默认端口 25565。",
+    "hint": "默认关闭，作用于添加服务器和查询未保存地址。",
     "default": false
   },
   "mutation_requires_admin": {
     "type": "bool",
-    "description": "Require administrator permission for saved-server and template mutations in group chats.",
-    "hint": "Default true. Applies to group command handlers and LLM tools; private chats are exempt.",
-    "default": true
+    "description": "旧版群聊写操作管理员权限总开关。",
+    "hint": "仅用于首次升级时迁移旧配置，界面中不会显示。",
+    "default": true,
+    "invisible": true
+  },
+  "_feature_permissions_v2_migrated": {
+    "type": "bool",
+    "description": "独立权限配置迁移完成标记。",
+    "hint": "由插件自动维护，界面中不会显示。",
+    "default": false,
+    "invisible": true
+  },
+  "query_server_requires_admin": {
+    "type": "bool",
+    "description": "群聊中查询已保存服务器或执行无参数全量查询时，是否要求群管理员权限。",
+    "hint": "默认关闭；命令与 query_mc_server Tool 共用此配置，私聊不受限制。",
+    "default": false
   },
   "direct_query_requires_admin": {
     "type": "bool",
-    "description": "Require administrator permission to query an unsaved address directly in group chats.",
-    "hint": "Default true. Private chats and queries of saved servers are exempt.",
+    "description": "群聊中直连查询未保存服务器地址时，是否要求群管理员权限。",
+    "hint": "默认开启；命令与 query_mc_server Tool 共用此配置，私聊不受限制。",
     "default": true
+  },
+  "query_history_requires_admin": {
+    "type": "bool",
+    "description": "群聊中查询服务器历史状态时，是否要求群管理员权限。",
+    "hint": "默认关闭，作用于 query_history_status Tool，私聊不受限制。",
+    "default": false
+  },
+  "add_server_requires_admin": {
+    "type": "bool",
+    "description": "群聊中添加服务器主线路时，是否要求群管理员权限。",
+    "hint": "默认开启；命令与 add_mc_server Tool 共用此配置，私聊不受限制。",
+    "default": true
+  },
+  "add_backup_requires_admin": {
+    "type": "bool",
+    "description": "群聊中添加服务器备用线路时，是否要求群管理员权限。",
+    "hint": "默认开启；命令与 add_mc_server_backup Tool 共用此配置，私聊不受限制。",
+    "default": true
+  },
+  "delete_server_requires_admin": {
+    "type": "bool",
+    "description": "群聊中删除服务器时，是否要求群管理员权限。",
+    "hint": "默认开启；命令与 delete_mc_server Tool 共用此配置，私聊不受限制。",
+    "default": true
+  },
+  "rename_server_requires_admin": {
+    "type": "bool",
+    "description": "群聊中重命名服务器时，是否要求群管理员权限。",
+    "hint": "默认开启；命令与 rename_mc_server Tool 共用此配置，私聊不受限制。",
+    "default": true
+  },
+  "list_servers_requires_admin": {
+    "type": "bool",
+    "description": "群聊中查看服务器列表时，是否要求群管理员权限。",
+    "hint": "默认关闭；命令与 list_mc_servers Tool 共用此配置，私聊不受限制。",
+    "default": false
+  },
+  "redirect_server_requires_admin": {
+    "type": "bool",
+    "description": "群聊中重定向服务器主线路时，是否要求群管理员权限。",
+    "hint": "默认开启；命令与 redirect_mc_server Tool 共用此配置，私聊不受限制。",
+    "default": true
+  },
+  "list_templates_requires_admin": {
+    "type": "bool",
+    "description": "群聊中查看可用模板列表时，是否要求群管理员权限。",
+    "hint": "默认关闭，作用于无参数 /模板 命令，私聊不受限制。",
+    "default": false
+  },
+  "switch_template_requires_admin": {
+    "type": "bool",
+    "description": "群聊中切换当前会话模板时，是否要求群管理员权限。",
+    "hint": "默认开启；命令与 switch_mc_template Tool 共用此配置，私聊不受限制。",
+    "default": true
+  },
+  "reload_templates_requires_admin": {
+    "type": "bool",
+    "description": "群聊中重载模板缓存时，是否要求群管理员权限。",
+    "hint": "默认开启，作用于 /模板重载 和兼容式 /模板 reload 命令，私聊不受限制。",
+    "default": true
+  },
+  "resolve_server_name_requires_admin": {
+    "type": "bool",
+    "description": "群聊中使用模糊线索解析服务器名称时，是否要求群管理员权限。",
+    "hint": "默认关闭，作用于 resolve_server_name Tool，私聊不受限制。",
+    "default": false
+  },
+  "default_offline_motd": {
+    "type": "string",
+    "description": "服务器离线且没有历史 MOTD 时显示的默认文案。",
+    "hint": "默认“邦邦咔邦”；不会覆盖服务器返回或缓存中已有的 MOTD。",
+    "default": "邦邦咔邦"
   },
   "query_all_concurrency": {
     "type": "int",
-    "description": "Max concurrent requests for '/查询服务器' (all servers).",
-    "hint": "Default 5. Range 1-20.",
+    "description": "无参数全量查询时允许同时查询的最大服务器数量。",
+    "hint": "默认 5，可填写 1 至 20。",
     "default": 5
   },
   "max_servers_per_session": {
     "type": "int",
-    "description": "Maximum saved servers in one group or private-session scope.",
-    "hint": "Default 50. Range 1-500.",
+    "description": "每个群聊或私聊会话最多保存的服务器数量。",
+    "hint": "默认 50，可填写 1 至 500。",
     "default": 50
   },
   "avatar_download_concurrency": {
     "type": "int",
-    "description": "Max concurrent player skin/avatar downloads.",
-    "hint": "Default 5. Range 1-20.",
+    "description": "玩家皮肤和头像下载的最大并发数。",
+    "hint": "默认 5，可填写 1 至 20。",
     "default": 5
   },
   "avatar_download_retries": {
     "type": "int",
-    "description": "Retry count for each avatar download candidate.",
-    "hint": "Default 2 (total attempts = 1 + retries). Range 0-5.",
+    "description": "每个玩家头像下载失败后的重试次数。",
+    "hint": "默认重试 2 次，总尝试次数为 3 次；可填写 0 至 5。",
     "default": 2
   },
   "avatar_batch_timeout_seconds": {
     "type": "int",
-    "description": "Total timeout for collecting one server's player avatars.",
-    "hint": "Default 30. Range 1-120.",
+    "description": "收集单台服务器全部玩家头像的总超时时间（秒）。",
+    "hint": "默认 30 秒，可填写 1 至 120。",
     "default": 30
   },
   "render_timeout_seconds": {
     "type": "int",
-    "description": "Total timeout for rendering one server report image.",
-    "hint": "Default 30. Range 1-120.",
+    "description": "生成单张服务器状态图片的总超时时间（秒）。",
+    "hint": "默认 30 秒，可填写 1 至 120。",
     "default": 30
   },
   "query_result_cache_ttl_seconds": {
     "type": "int",
-    "description": "TTL for single-server rendered image cache.",
-    "hint": "Default 10. Range 1-300. Repeated single queries within this window return cached image.",
+    "description": "单服查询渲染图片缓存的有效时间（秒）。",
+    "hint": "默认 10 秒，可填写 1 至 300；有效期内重复查询会直接返回缓存图片。",
     "default": 10
   },
   "skin_api_url_template": {
     "type": "string",
-    "description": "Skin API URL template used to fetch skin by UUID.",
-    "hint": "Must be an HTTP(S) URL containing only the '{uuid}' placeholder. Invalid value falls back to default.",
+    "description": "根据玩家 UUID 获取皮肤时使用的接口地址模板。",
+    "hint": "必须是仅包含 `{uuid}` 占位符的 HTTP(S) 地址；无效配置会回退到默认值。",
     "default": "https://skin.mualliance.ltd/api/union/skin/byuuid/{uuid}"
   }
 }

@@ -67,9 +67,36 @@ COMMAND_FALLBACK_PATTERN = re.compile(COMMAND_FALLBACK_REGEX)
 
 # 是否自动补全默认端口（可被插件配置覆盖）
 AUTO_APPEND_DEFAULT_PORT = False
-# 群聊中的写操作和未保存地址直连默认仅允许管理员
+# 旧版群聊写操作总开关，仅用于兼容已有配置
 MUTATION_REQUIRES_ADMIN = True
 DIRECT_QUERY_REQUIRES_ADMIN = True
+FEATURE_ADMIN_DEFAULTS = {
+    "query_server_requires_admin": False,
+    "direct_query_requires_admin": DIRECT_QUERY_REQUIRES_ADMIN,
+    "query_history_requires_admin": False,
+    "add_server_requires_admin": True,
+    "add_backup_requires_admin": True,
+    "delete_server_requires_admin": True,
+    "rename_server_requires_admin": True,
+    "list_servers_requires_admin": False,
+    "redirect_server_requires_admin": True,
+    "list_templates_requires_admin": False,
+    "switch_template_requires_admin": True,
+    "reload_templates_requires_admin": True,
+    "resolve_server_name_requires_admin": False,
+}
+LEGACY_MUTATION_PERMISSION_KEYS = frozenset(
+    {
+        "add_server_requires_admin",
+        "delete_server_requires_admin",
+        "rename_server_requires_admin",
+        "redirect_server_requires_admin",
+        "switch_template_requires_admin",
+        "reload_templates_requires_admin",
+    }
+)
+LEGACY_MUTATION_CONFIG_KEY = "mutation_requires_admin"
+FEATURE_PERMISSIONS_MIGRATION_KEY = "_feature_permissions_v2_migrated"
 # 静默轮询间隔：30 分钟
 SILENT_QUERY_INTERVAL_SECONDS = 30 * 60
 # 仅保留最近 48 个延迟点（刚好对应 24 小时，30 分钟/点）
@@ -101,7 +128,7 @@ QUERY_RESULT_CACHE_TTL_SECONDS = 10
 QUERY_CACHE_CLEANUP_INTERVAL_SECONDS = 5 * 60
 # LLM Tool 返回结构版本
 TOOL_VERSION = "1.2"
-PLUGIN_VERSION = "v2.0.1"
+PLUGIN_VERSION = "v2.0.2"
 # Tool 查询状态缓存，避免 Agent 连续追问时重复打到 MC 服务端
 TOOL_STATUS_CACHE_TTL_SECONDS = 30
 # Tool 列表缓存，避免 Agent 连续追问列表细节时重复读取存储
@@ -193,8 +220,9 @@ class Main(Star):
         self.render_timeout_seconds = RENDER_TIMEOUT_SECONDS
         self.skin_api_url_template = SKIN_API_URL_TEMPLATE
         self.auto_append_default_port = AUTO_APPEND_DEFAULT_PORT
-        self.mutation_requires_admin = MUTATION_REQUIRES_ADMIN
-        self.direct_query_requires_admin = DIRECT_QUERY_REQUIRES_ADMIN
+        for setting_name, default in FEATURE_ADMIN_DEFAULTS.items():
+            setattr(self, setting_name, default)
+        self.default_offline_motd = DEFAULT_OFFLINE_MOTD
         self.query_result_cache_ttl_seconds = QUERY_RESULT_CACHE_TTL_SECONDS
         self._query_render_cache: dict[
             tuple[str, str, str, str], QueryRenderCacheEntry
@@ -260,7 +288,7 @@ class Main(Star):
         """添加 MC 服务器：/添加服务器 <服务器名称> <服务器地址>；或 /添加 <服务器名称> <服务器地址>"""
         if self._should_ignore_self_event(event):
             return
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(event, self.add_server_requires_admin):
             yield event.plain_result("权限不足：该操作仅限管理员")
             return
         if self._check_command_rate_limit(event):
@@ -317,7 +345,7 @@ class Main(Star):
         """为已保存服务器添加备用线路。"""
         if self._should_ignore_self_event(event):
             return
-        if self._is_group_admin_denied(event):
+        if self._is_feature_admin_denied(event, self.add_backup_requires_admin):
             yield event.plain_result("权限不足：该操作仅限管理员")
             return
         if self._check_command_rate_limit(event):
@@ -406,10 +434,22 @@ class Main(Star):
                 query_token,
             )
             if len(matched_addresses) > 1:
+                if self._is_feature_admin_denied(
+                    event,
+                    self.query_server_requires_admin,
+                ):
+                    yield event.plain_result("权限不足：该操作仅限管理员")
+                    return
                 return_message = f"查询失败！检测到多个同名服务器 [{query_token}]，请使用服务器地址查询"
                 yield event.plain_result(return_message)
                 return
             if len(matched_addresses) == 1:
+                if self._is_feature_admin_denied(
+                    event,
+                    self.query_server_requires_admin,
+                ):
+                    yield event.plain_result("权限不足：该操作仅限管理员")
+                    return
                 yield await self._query_single_server(event, matched_addresses[0])
                 return
 
@@ -419,18 +459,33 @@ class Main(Star):
                 normalized_query,
             )
             if primary_address is not None:
+                if self._is_feature_admin_denied(
+                    event,
+                    self.query_server_requires_admin,
+                ):
+                    yield event.plain_result("权限不足：该操作仅限管理员")
+                    return
                 yield await self._query_single_server(event, primary_address)
                 return
 
             # 未命中已添加的服务器名称时，尝试按地址直连查询；
             # 若输入看起来是名称而非地址，则直接反馈不存在。
             if "." not in query_token and ":" not in query_token:
+                if self._is_feature_admin_denied(
+                    event,
+                    self.query_server_requires_admin,
+                ):
+                    yield event.plain_result("权限不足：该操作仅限管理员")
+                    return
                 yield event.plain_result(
                     f"当前会话内不存在名为 [{query_token}] 的服务器"
                 )
                 return
 
-            if self.direct_query_requires_admin and self._is_group_admin_denied(event):
+            if self._is_feature_admin_denied(
+                event,
+                self.direct_query_requires_admin,
+            ):
                 yield event.plain_result("权限不足：直连未保存地址仅限管理员")
                 return
 
@@ -440,6 +495,12 @@ class Main(Star):
             )
             return
 
+        if self._is_feature_admin_denied(
+            event,
+            self.query_server_requires_admin,
+        ):
+            yield event.plain_result("权限不足：该操作仅限管理员")
+            return
         yield await self._query_all_servers(event)
 
     @filter.regex(r"^/模板(?:\s+\S+)?\s*$")
@@ -459,6 +520,12 @@ class Main(Star):
 
         template_name = matched.group(1)
         if not template_name:
+            if self._is_feature_admin_denied(
+                event,
+                self.list_templates_requires_admin,
+            ):
+                yield event.plain_result("权限不足：该操作仅限管理员")
+                return
             names = self._list_templates()
             output = "已有模板如下："
             if names:
@@ -466,16 +533,28 @@ class Main(Star):
             yield event.plain_result(output)
             return
 
-        if self._is_mutation_denied(event):
+        if template_name == "reload" and template_name not in self._list_templates():
+            if self._is_feature_admin_denied(
+                event,
+                self.reload_templates_requires_admin,
+            ):
+                yield event.plain_result("权限不足：该操作仅限管理员")
+                return
+            if self._check_command_rate_limit(event):
+                yield event.plain_result("请求过于频繁，请稍后再试")
+                return
+            self._reload_template_caches()
+            yield event.plain_result("模板缓存已重载")
+            return
+
+        if self._is_feature_admin_denied(
+            event,
+            self.switch_template_requires_admin,
+        ):
             yield event.plain_result("权限不足：该操作仅限管理员")
             return
         if self._check_command_rate_limit(event):
             yield event.plain_result("请求过于频繁，请稍后再试")
-            return
-
-        if template_name == "reload" and template_name not in self._list_templates():
-            self._reload_template_caches()
-            yield event.plain_result("模板缓存已重载")
             return
 
         result = await self._switch_template_data(
@@ -495,7 +574,10 @@ class Main(Star):
         """Reload template and rendered-image caches."""
         if self._should_ignore_self_event(event):
             return
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(
+            event,
+            self.reload_templates_requires_admin,
+        ):
             yield event.plain_result("权限不足：该操作仅限管理员")
             return
 
@@ -507,7 +589,7 @@ class Main(Star):
         """重命名当前会话中的服务器：/重命名服务器 <旧名称> <新名称>；或 /重命名 <旧名称> <新名称>"""
         if self._should_ignore_self_event(event):
             return
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(event, self.rename_server_requires_admin):
             yield event.plain_result("权限不足：该操作仅限管理员")
             return
 
@@ -559,7 +641,7 @@ class Main(Star):
         """删除当前会话中的服务器：/删除服务器 <服务器名称>；或 /删除 <服务器名称>"""
         if self._should_ignore_self_event(event):
             return
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(event, self.delete_server_requires_admin):
             yield event.plain_result("权限不足：该操作仅限管理员")
             return
 
@@ -624,6 +706,9 @@ class Main(Star):
     async def list_servers(self, event: AstrMessageEvent):
         """列出当前会话内服务器：/服务器列表；或 /列表"""
         if self._should_ignore_self_event(event):
+            return
+        if self._is_feature_admin_denied(event, self.list_servers_requires_admin):
+            yield event.plain_result("权限不足：该操作仅限管理员")
             return
 
         matched = LIST_SERVER_PATTERN.match(event.message_str.strip())
@@ -731,7 +816,10 @@ class Main(Star):
         """重定向 MC 服务器地址：/重定向 <服务器名称> <新地址>"""
         if self._should_ignore_self_event(event):
             return
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(
+            event,
+            self.redirect_server_requires_admin,
+        ):
             yield event.plain_result("权限不足：该操作仅限管理员")
             return
         if self._check_command_rate_limit(event):
@@ -795,13 +883,19 @@ class Main(Star):
         if rate_limited:
             return rate_limited
         try:
+            allow_managed = not self._is_feature_admin_denied(
+                event,
+                self.query_server_requires_admin,
+            )
             allow_direct = (
-                not self.direct_query_requires_admin
-                or not self._is_group_admin_denied(event)
+                not self._is_feature_admin_denied(
+                    event,
+                    self.direct_query_requires_admin,
+                )
             )
             cache_key = (
                 self._build_tool_status_cache_key(session_key, server)
-                + f"|direct={int(allow_direct)}"
+                + f"|managed={int(allow_managed)}|direct={int(allow_direct)}"
             )
             cached = self._try_get_tool_status_cache(cache_key)
             if cached is not None:
@@ -810,6 +904,7 @@ class Main(Star):
                 result = await self._query_server_data(
                     session_key,
                     server,
+                    allow_managed=allow_managed,
                     allow_direct=allow_direct,
                 )
             if result.get("ok"):
@@ -838,6 +933,11 @@ class Main(Star):
         不要用于查询服务器当前是否在线或当前延迟；当前状态请调用
         query_mc_server。
         """
+        if self._is_feature_admin_denied(
+            event,
+            self.query_history_requires_admin,
+        ):
+            return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
             return rate_limited
@@ -869,7 +969,7 @@ class Main(Star):
         不要用于查询服务器状态、Minecraft 客户端安装、Java 环境、
         Mod、插件配置或游戏攻略问题。
         """
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(event, self.add_server_requires_admin):
             return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
@@ -891,13 +991,13 @@ class Main(Star):
         """为当前会话中已保存的 Minecraft 服务器添加备用线路。
 
         当用户要求为一个已保存服务器添加备用、备选或故障转移地址时调用。
-        添加前会验证新地址可连接。群聊仅管理员可用，私聊不要求管理员权限。
+        添加前会验证新地址可连接。
 
         Args:
             server(string): 当前会话中已保存的服务器名称，例如：生存服。
             address(string): 与会话内所有已保存线路不同的新地址，例如：backup.example.com:25565。
         """
-        if self._is_group_admin_denied(event):
+        if self._is_feature_admin_denied(event, self.add_backup_requires_admin):
             return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
@@ -931,7 +1031,7 @@ class Main(Star):
         不要用于查询服务器状态、卸载 Minecraft 客户端、删除 Mod、
         删除 AstrBot 插件或游戏存档管理。
         """
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(event, self.delete_server_requires_admin):
             return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
@@ -964,7 +1064,7 @@ class Main(Star):
         不要用于修改 Minecraft 用户名、服务器地址、Mod 名称、
         插件名称或非本插件保存的服务器名称。
         """
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(event, self.rename_server_requires_admin):
             return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
@@ -993,6 +1093,8 @@ class Main(Star):
         不要用于查询服务器是否在线、Minecraft 客户端安装、Java 环境、
         Mod、插件配置或游戏攻略问题。
         """
+        if self._is_feature_admin_denied(event, self.list_servers_requires_admin):
+            return self._tool_permission_denied()
         session_key = event.unified_msg_origin
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
@@ -1038,7 +1140,10 @@ class Main(Star):
         不要用于切换 Minecraft 客户端版本、Java 版本、材质包、
         光影包、Mod 或服务器自身插件。
         """
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(
+            event,
+            self.switch_template_requires_admin,
+        ):
             return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
@@ -1071,6 +1176,11 @@ class Main(Star):
         不要用于直接查询服务器在线状态；确认具体服务器后再调用
         query_mc_server。
         """
+        if self._is_feature_admin_denied(
+            event,
+            self.resolve_server_name_requires_admin,
+        ):
+            return self._tool_permission_denied()
         session_key = event.unified_msg_origin
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
@@ -1099,7 +1209,10 @@ class Main(Star):
             new_address(string): 新的服务器地址
         """
         session_key = event.unified_msg_origin
-        if self._is_mutation_denied(event):
+        if self._is_feature_admin_denied(
+            event,
+            self.redirect_server_requires_admin,
+        ):
             return self._tool_permission_denied()
         rate_limited = self._check_tool_rate_limit(self._build_tool_actor_key(event))
         if rate_limited:
@@ -1298,6 +1411,7 @@ class Main(Star):
         session_key: str,
         server: str,
         *,
+        allow_managed: bool = True,
         allow_direct: bool = True,
     ) -> dict[str, Any]:
         """Query server data for LLM tools without rendering images."""
@@ -1316,6 +1430,16 @@ class Main(Star):
             servers: dict[str, dict[str, Any]] = dict(session_obj.get("servers", {}))
 
         matched_addresses = self._find_server_addresses_by_name(servers, query_token)
+        if matched_addresses and not allow_managed:
+            return {
+                "ok": False,
+                "online": False,
+                "server": query_token,
+                "address": matched_addresses[0],
+                "managed": True,
+                "error": "PERMISSION_DENIED",
+                "message": "administrator permission is required",
+            }
         if len(matched_addresses) > 1:
             return {
                 "ok": False,
@@ -1335,6 +1459,16 @@ class Main(Star):
             )
         managed = primary_address is not None
         address = primary_address if managed else self._normalize_address(query_token)
+        if managed and not allow_managed:
+            return {
+                "ok": False,
+                "online": False,
+                "server": query_token,
+                "address": address,
+                "managed": True,
+                "error": "PERMISSION_DENIED",
+                "message": "administrator permission is required",
+            }
         if not managed and not allow_direct:
             return {
                 "ok": False,
@@ -2493,7 +2627,7 @@ class Main(Star):
                 history = []
             cached_motd = str(server_obj.get("motd", "") or "").strip()
             if not cached_motd:
-                cached_motd = DEFAULT_OFFLINE_MOTD
+                cached_motd = self.default_offline_motd
             now = int(time.time())
             icon_path = self._find_cached_server_icon(address, server_obj)
             renderer = await self._get_template_renderer(template_name)
@@ -3185,6 +3319,7 @@ class Main(Star):
 
     def _load_runtime_config(self) -> None:
         """读取插件配置并覆盖运行时参数。"""
+        self._migrate_legacy_permission_config()
         self.silent_query_interval_seconds = self._get_config_int(
             "silent_query_interval_seconds",
             SILENT_QUERY_INTERVAL_SECONDS,
@@ -3258,14 +3393,48 @@ class Main(Star):
             "auto_append_default_port",
             AUTO_APPEND_DEFAULT_PORT,
         )
-        self.mutation_requires_admin = self._get_config_bool(
-            "mutation_requires_admin",
+        legacy_mutation_requires_admin = self._get_config_bool(
+            LEGACY_MUTATION_CONFIG_KEY,
             MUTATION_REQUIRES_ADMIN,
         )
-        self.direct_query_requires_admin = self._get_config_bool(
-            "direct_query_requires_admin",
-            DIRECT_QUERY_REQUIRES_ADMIN,
+        for setting_name, default in FEATURE_ADMIN_DEFAULTS.items():
+            fallback = (
+                legacy_mutation_requires_admin
+                if setting_name in LEGACY_MUTATION_PERMISSION_KEYS
+                else default
+            )
+            setattr(
+                self,
+                setting_name,
+                self._get_config_bool(setting_name, fallback),
+            )
+        self.default_offline_motd = self._get_config_str(
+            "default_offline_motd",
+            DEFAULT_OFFLINE_MOTD,
         )
+
+    def _migrate_legacy_permission_config(self) -> None:
+        """将旧版写操作总开关一次性迁移到对应的独立权限项。"""
+        config = self._plugin_config
+        if not hasattr(config, "get") or LEGACY_MUTATION_CONFIG_KEY not in config:
+            return
+        if self._get_config_bool(FEATURE_PERMISSIONS_MIGRATION_KEY, False):
+            return
+
+        legacy_value = self._get_config_bool(
+            LEGACY_MUTATION_CONFIG_KEY,
+            MUTATION_REQUIRES_ADMIN,
+        )
+        for setting_name in LEGACY_MUTATION_PERMISSION_KEYS:
+            config[setting_name] = legacy_value
+        config[FEATURE_PERMISSIONS_MIGRATION_KEY] = True
+
+        save_config = getattr(config, "save_config", None)
+        if callable(save_config):
+            try:
+                save_config()
+            except Exception:
+                logger.exception("旧版权限配置迁移结果保存失败")
 
     def _get_config_int(
         self,
@@ -3466,8 +3635,12 @@ class Main(Star):
     def _is_group_admin_denied(self, event: AstrMessageEvent) -> bool:
         return not self._is_private_event(event) and not self._is_admin_event(event)
 
-    def _is_mutation_denied(self, event: AstrMessageEvent) -> bool:
-        return self.mutation_requires_admin and self._is_group_admin_denied(event)
+    def _is_feature_admin_denied(
+        self,
+        event: AstrMessageEvent,
+        requires_admin: bool,
+    ) -> bool:
+        return requires_admin and self._is_group_admin_denied(event)
 
     @staticmethod
     def _build_help_message() -> str:
