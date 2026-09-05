@@ -120,8 +120,8 @@ AVATAR_DOWNLOAD_RETRIES = 2
 # 头像批处理与图片渲染的端到端超时
 AVATAR_BATCH_TIMEOUT_SECONDS = 30
 RENDER_TIMEOUT_SECONDS = 30
-# 皮肤接口（按 UUID 获取玩家皮肤）
-SKIN_API_URL_TEMPLATE = "https://skin.mualliance.ltd/api/union/skin/byuuid/{uuid}"
+# 皮肤接口（优先按 name 获取玩家皮肤，uuid 作为 fallback）
+SKIN_API_URL_TEMPLATE = "https://skin.mualliance.ltd/api/union/skin/byname/{name}"
 # 单服查询结果渲染缓存时长（秒）
 QUERY_RESULT_CACHE_TTL_SECONDS = 10
 # 查询渲染缓存清理任务间隔（秒）
@@ -3099,6 +3099,7 @@ class Main(Star):
                         return {"name": name, "avatar_path": str(avatar_path)}
                     _ = await _avatar_mod.download_and_render_avatar_by_uuid(
                         uid=uid,
+                        name=name,
                         avatar_path=avatar_path,
                         skin_api_url_template=self.skin_api_url_template,
                         avatar_download_retries=self.avatar_download_retries,
@@ -3495,7 +3496,7 @@ class Main(Star):
 
     @staticmethod
     def _normalize_skin_api_url_template(template: str) -> str:
-        """Validate a bounded HTTP(S) skin URL with only a UUID placeholder."""
+        """Validate a bounded HTTP(S) skin URL with one of {name}/{uuid} placeholders."""
         if not template or len(template) > 2_048:
             return SKIN_API_URL_TEMPLATE
         try:
@@ -3503,12 +3504,13 @@ class Main(Star):
             for _, field_name, format_spec, conversion in Formatter().parse(template):
                 if field_name is None:
                     continue
-                if field_name != "uuid" or format_spec or conversion:
+                if field_name not in {"name", "uuid"} or format_spec or conversion:
                     return SKIN_API_URL_TEMPLATE
-                fields.append(field_name)
+                if field_name not in fields:
+                    fields.append(field_name)
             if not fields:
                 return SKIN_API_URL_TEMPLATE
-            preview = template.format(uuid="0" * 32)
+            preview = template.format(name="0", uuid="0" * 32)
             parsed = urlsplit(preview)
         except (KeyError, TypeError, ValueError):
             return SKIN_API_URL_TEMPLATE

@@ -36,29 +36,37 @@ MAX_RETRY_AFTER_SECONDS = 30.0
 async def download_and_render_avatar_by_uuid(
     *,
     uid: str,
+    name: str = "",
     avatar_path: Path,
     skin_api_url_template: str,
     avatar_download_retries: int,
     semaphore: asyncio.Semaphore,
     session: aiohttp.ClientSession | None,
 ) -> bool:
-    """通过 UUID 拉取皮肤并渲染头像。
+    """拉取皮肤并渲染头像，name 提供时优先按 name 路由，uuid 作为 fallback。
 
     流程：
-    1) 调用 skin.mualliance.ltd API 获取皮肤图；
-    2) 使用 PILSkinMC 渲染成玩家立体头像；
-    3) 缩放到 SKIN_SIZE 并缓存为 PNG。
+    1) 优先按 name 走 byname 路由（union API 的正规范式）；
+    2) name 为空或 404 时按 uuid 走 byuuid fallback；
+    3) 使用 PILSkinMC 渲染成玩家立体头像；
+    4) 缩放到 SKIN_SIZE 并缓存为 PNG。
     """
     if not session:
         return False
 
+    order: list[tuple[str, str]] = []
+    if name:
+        order.append(("name", str(name)))
+    for candidate_uuid in build_uuid_candidates(uid):
+        order.append(("uuid", candidate_uuid))
+
     # Collect compact failure reasons for operation visibility and diagnostics.
     failed_reasons: list[str] = []
-    for candidate_uuid in build_uuid_candidates(uid):
+    for field_name, field_value in order:
         try:
-            url = skin_api_url_template.format(uuid=candidate_uuid)
+            url = skin_api_url_template.format(**{field_name: field_value})
         except (KeyError, ValueError):
-            failed_reasons.append(f"{candidate_uuid}:invalid_url_template")
+            failed_reasons.append(f"{field_value}:invalid_url_template")
             break
         for attempt in range(avatar_download_retries + 1):
             should_retry = attempt < avatar_download_retries
@@ -75,7 +83,7 @@ async def download_and_render_avatar_by_uuid(
                                 and content_length > MAX_SKIN_BYTES
                             ):
                                 failed_reasons.append(
-                                    f"{candidate_uuid}:200_skin_too_large"
+                                    f"{field_value}:200_skin_too_large"
                                 )
                                 should_retry = False
                                 break
@@ -85,7 +93,7 @@ async def download_and_render_avatar_by_uuid(
                                 raw = exc.partial
                             if len(raw) > MAX_SKIN_BYTES:
                                 failed_reasons.append(
-                                    f"{candidate_uuid}:200_skin_too_large"
+                                    f"{field_value}:200_skin_too_large"
                                 )
                                 should_retry = False
                                 break
@@ -95,29 +103,29 @@ async def download_and_render_avatar_by_uuid(
                                 avatar_path=avatar_path,
                             ):
                                 return True
-                            # 即使状态码 200，内容也可能非有效皮肤；直接放弃该候选 UUID
-                            failed_reasons.append(f"{candidate_uuid}:200_invalid_skin")
+                            # 即使状态码 200，内容也可能非有效皮肤；直接放弃该字段值
+                            failed_reasons.append(f"{field_value}:200_invalid_skin")
                             should_retry = False
                             break
-                        # 404 表示该 UUID 没有皮肤记录，尝试下一个 UUID 候选
+                        # 404 表示该字段值没有皮肤记录，尝试下一个候选
                         if resp.status == 404:
-                            failed_reasons.append(f"{candidate_uuid}:404")
+                            failed_reasons.append(f"{field_value}:404")
                             should_retry = False
                             break
                         if resp.status == 429:
-                            failed_reasons.append(f"{candidate_uuid}:429")
+                            failed_reasons.append(f"{field_value}:429")
                             retry_after_seconds = parse_retry_after_seconds(
                                 resp.headers.get("Retry-After")
                             )
                         # 4xx(除 429)通常不适合重试
                         elif resp.status < 500:
-                            failed_reasons.append(f"{candidate_uuid}:{resp.status}")
+                            failed_reasons.append(f"{field_value}:{resp.status}")
                             should_retry = False
                             break
                         else:
-                            failed_reasons.append(f"{candidate_uuid}:{resp.status}")
+                            failed_reasons.append(f"{field_value}:{resp.status}")
             except Exception as exc:
-                failed_reasons.append(f"{candidate_uuid}:exc:{type(exc).__name__}")
+                failed_reasons.append(f"{field_value}:exc:{type(exc).__name__}")
 
             if should_retry:
                 # Respect Retry-After on 429 when available; otherwise use short backoff.

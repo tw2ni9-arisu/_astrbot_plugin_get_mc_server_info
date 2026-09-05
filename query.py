@@ -143,8 +143,10 @@ async def _fetch_server_status_once(
         raise McServerConnectionError("server status failed") from exc
 
     icon_base64 = None
-    if getattr(status, "favicon", None):
-        candidate_icon = str(status.favicon)
+    # mcstatus 14.x 将 favicon 改名为 icon；兼容新旧版本
+    favicon = getattr(status, "favicon", None) or getattr(status, "icon", None)
+    if favicon:
+        candidate_icon = str(favicon)
         if len(candidate_icon) <= MAX_FAVICON_TEXT_LENGTH:
             icon_base64 = candidate_icon
 
